@@ -26,6 +26,12 @@ class MetricsRegistry:
         self.total_requests = 0
         self.status_counts: dict[str, int] = defaultdict(int)
         self.path_counts: dict[str, int] = defaultdict(int)
+        # 改造点：按路由分别统计耗时。
+        # 只留一个全局平均值会被健康检查（毫秒级）稀释：5 次请求里 4 次是探活，
+        # 真实规划 40s 会被算成 10s，看板上的数字直接失真。
+        # key 用「路由模板」（/api/trip/plan）而不是真实 URL（带 plan_id），
+        # 否则每个 plan_id 都会新开一个 key，指标基数随请求量爆炸。
+        self.path_latency: dict[str, dict[str, float]] = {}
         self.total_latency_ms = 0.0
         self.max_latency_ms = 0.0
         # LLM 调用指标：一次规划会发多个候选请求，"成功率"是最关键的运行指标之一
@@ -54,6 +60,18 @@ class MetricsRegistry:
             self.total_latency_ms += latency_ms
             if latency_ms > self.max_latency_ms:
                 self.max_latency_ms = latency_ms
+            slot = self.path_latency.get(path)
+            if slot is None:
+                self.path_latency[path] = {
+                    "count": 1.0,
+                    "total_ms": latency_ms,
+                    "max_ms": latency_ms,
+                }
+            else:
+                slot["count"] += 1
+                slot["total_ms"] += latency_ms
+                if latency_ms > slot["max_ms"]:
+                    slot["max_ms"] = latency_ms
 
     def record_llm(self, ok: bool) -> None:
         """记录一次 LLM 调用结果（含重试后的最终结果）。"""
@@ -138,6 +156,15 @@ class MetricsRegistry:
                 "path_counts": dict(self.path_counts),
                 "avg_latency_ms": round(avg, 2),
                 "max_latency_ms": round(self.max_latency_ms, 2),
+                # 改造点：按路由的耗时分布——全局 avg 会被探活请求稀释，这里才是真实口径
+                "latency_by_path": {
+                    path: {
+                        "count": int(slot["count"]),
+                        "avg_ms": round(slot["total_ms"] / slot["count"], 2),
+                        "max_ms": round(slot["max_ms"], 2),
+                    }
+                    for path, slot in sorted(self.path_latency.items())
+                },
                 # 改造点：LLM 调用成功率——单看 HTTP 200 看不出模型在退化和限流
                 "llm_calls": self.llm_calls,
                 "llm_failures": self.llm_failures,
@@ -179,15 +206,21 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception:
             latency_ms = (time.perf_counter() - started) * 1000
-            metrics.record(request.url.path, 500, latency_ms)
+            metrics.record(_route_key(request), 500, latency_ms)
             print(f"[REQ] {request_id} {request.method} {request.url.path} -> 500 {latency_ms:.0f}ms")
             raise
 
         latency_ms = (time.perf_counter() - started) * 1000
         response.headers["X-Request-ID"] = request_id
-        metrics.record(request.url.path, response.status_code, latency_ms)
+        metrics.record(_route_key(request), response.status_code, latency_ms)
         print(
             f"[REQ] {request_id} {request.method} {request.url.path} "
             f"-> {response.status_code} {latency_ms:.0f}ms"
         )
         return response
+
+
+def _route_key(request: Request) -> str:
+    """取路由模板作为指标 key，未命中路由（404）时退回真实路径。"""
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or request.url.path

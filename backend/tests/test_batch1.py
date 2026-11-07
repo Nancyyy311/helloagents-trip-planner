@@ -48,3 +48,34 @@ def test_unknown_async_task_404():
     """改造点：异步任务查询，未知 task_id 应返回 404（不触发真实生成）。"""
     r = client.get("/api/trip/plan/async/does-not-exist")
     assert r.status_code == 404
+
+
+def test_latency_by_path_isolated():
+    """改造点：耗时按路由分别统计，探活请求不会稀释规划接口的真实耗时。
+
+    只暴露一个全局平均值时，5 次请求里 4 次是毫秒级探活，
+    40s 的规划会被算成 10s，看板数字直接失真。
+    """
+    from app.api.observability import MetricsRegistry
+
+    reg = MetricsRegistry()
+    reg.record("/health", 200, 2.0)
+    reg.record("/health", 200, 4.0)
+    reg.record("/api/trip/plan", 200, 40000.0)
+
+    snap = reg.snapshot()
+    by_path = snap["latency_by_path"]
+    assert by_path["/health"]["count"] == 2
+    assert by_path["/health"]["avg_ms"] == 3.0
+    assert by_path["/api/trip/plan"]["avg_ms"] == 40000.0
+    # 全局平均仍会被稀释，这正是要按路由看的原因
+    assert snap["avg_latency_ms"] < 14000
+
+
+def test_route_template_key_not_raw_url():
+    """改造点：指标 key 用路由模板，避免 plan_id 这类路径参数撑爆指标基数。"""
+    client.get("/api/trip/plan/abc123/refine")  # 不存在 plan_id，走 404 也没关系
+    data = client.get("/metrics").json()
+    keys = list(data["latency_by_path"].keys())
+    assert not any("abc123" in k for k in keys), keys
+
