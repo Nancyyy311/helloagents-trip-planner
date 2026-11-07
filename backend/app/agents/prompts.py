@@ -1,68 +1,11 @@
-"""Agent提示词。"""
+"""Agent提示词。
 
-# 主流程直接构造结构化 PlannerContext。
-# 下面三个工具 Agent 提示词先保留，便于对照和必要时回滚旧链路。
-
-ATTRACTION_AGENT_PROMPT = """你是景点搜索专家。你的任务是根据城市和用户偏好搜索合适的景点。
-
-**重要提示:**
-你必须使用工具来搜索景点!不要自己编造景点信息!
-
-**工具调用格式:**
-使用maps_text_search工具时,必须严格按照以下格式:
-`[TOOL_CALL:amap_maps_text_search:keywords=景点关键词,city=城市名]`
-
-**示例:**
-用户: "搜索北京的历史文化景点"
-你的回复: [TOOL_CALL:amap_maps_text_search:keywords=历史文化,city=北京]
-
-用户: "搜索上海的公园"
-你的回复: [TOOL_CALL:amap_maps_text_search:keywords=公园,city=上海]
-
-**注意:**
-1. 必须使用工具,不要直接回答
-2. 格式必须完全正确,包括方括号和冒号
-3. 参数用逗号分隔
-"""
-
-WEATHER_AGENT_PROMPT = """你是天气查询专家。你的任务是查询指定城市的天气信息。
-
-**重要提示:**
-你必须使用工具来查询天气!不要自己编造天气信息!
-
-**工具调用格式:**
-使用maps_weather工具时,必须严格按照以下格式:
-`[TOOL_CALL:amap_maps_weather:city=城市名]`
-
-**示例:**
-用户: "查询北京天气"
-你的回复: [TOOL_CALL:amap_maps_weather:city=北京]
-
-用户: "上海的天气怎么样"
-你的回复: [TOOL_CALL:amap_maps_weather:city=上海]
-
-**注意:**
-1. 必须使用工具,不要直接回答
-2. 格式必须完全正确,包括方括号和冒号
-"""
-
-HOTEL_AGENT_PROMPT = """你是酒店推荐专家。你的任务是根据城市和景点位置推荐合适的酒店。
-
-**重要提示:**
-你必须使用工具来搜索酒店!不要自己编造酒店信息!
-
-**工具调用格式:**
-使用maps_text_search工具搜索酒店时,必须严格按照以下格式:
-`[TOOL_CALL:amap_maps_text_search:keywords=酒店,city=城市名]`
-
-**示例:**
-用户: "搜索北京的酒店"
-你的回复: [TOOL_CALL:amap_maps_text_search:keywords=酒店,city=北京]
-
-**注意:**
-1. 必须使用工具,不要直接回答
-2. 格式必须完全正确,包括方括号和冒号
-3. 关键词使用"酒店"或"宾馆"
+改造记录（矛盾点清理）：
+原文件在这里定义了 ATTRACTION_AGENT_PROMPT / WEATHER_AGENT_PROMPT /
+HOTEL_AGENT_PROMPT 三个"专家 Agent"提示词，但全项目没有任何地方 import 它们，
+也从没创建过对应的 Agent 实例——属于"写着像多智能体，实际只有一个 Planner 在跑"
+的死代码。现已删除，改由 ``amap_tools.py`` 注册的真实工具（amap_search_poi /
+amap_weather）承担"查景点 / 查天气"的职责，名与实对齐。
 """
 
 PLANNER_AGENT_PROMPT = """你是行程规划专家。你的任务是根据 PlannerContext 生成详细的旅行计划，并且输出必须能被后端 TripPlan schema 直接解析。
@@ -198,3 +141,56 @@ I. budget.total = budget.total_attractions + budget.total_hotels + budget.total_
 14. 预算方案要贴合 budget_constraint：strictness=hard 时不要超过 amount；strictness=soft 时尽量贴近，轻微超出要在 overall_suggestions 解释；strictness=none 时只需合理估算。如果 PlannerContext.planner_constraints.budget_fit_policy 存在，budget.total 应尽量落在 target_min_total 和 target_max_total 之间；不要为了省钱显著低于用户预算档位。但预算贴合不能违反价格复制规则，不能复用同一家餐厅凑预算，不能把免费或低价景点写成高价景点。
 15. 所有 location 必须是对象，格式为 {"longitude": 数字, "latitude": 数字}，不能是字符串。
 """
+
+
+# === 改造点：允许工具调用的 Planner 提示词 ===
+# 原提示词第 2 条明确禁止"工具调用"，这和"给 Agent 挂工具"直接冲突：
+# 挂着工具却又不许调，模型只会退化成"预抓数据 + 一次性生成"。
+# 这里保留全部原有 JSON 硬性要求，只放开工具调用，并严格限定触发条件，
+# 避免每次规划都多花一轮 LLM 调用（约 40 秒）。
+_TOOL_POLICY = """
+
+## 工具使用规则（本段优先级高于上文"禁止工具调用"）
+你拥有真实的高德工具，可以在信息不足时补查，但必须严格遵守：
+1. 只有当 PlannerContext 确实缺少关键信息时才调用：某天天气缺失、需要确认某地点是否真实存在、需要某个 POI 的真实地址或坐标。
+2. PlannerContext 已经足够时必须直接输出 JSON，禁止为了"更保险"而调用工具。
+3. 一次回复最多调用一个工具，格式：[TOOL_CALL:工具名:参数=值]。
+4. 工具结果返回后立刻输出最终 JSON，不要再次调用工具。
+5. 只有工具结果里出现过、或 PlannerContext 里已有的地点才可以使用；查不到的一律视为不存在，禁止编造。
+6. 最终答案仍然只能是一个 JSON 对象，不能包含任何工具调用标记。
+"""
+
+_BASE_ALLOWING_TOOLS = PLANNER_AGENT_PROMPT.replace(
+    "、前言、后记、工具调用或", "、前言、后记或"
+)
+if _BASE_ALLOWING_TOOLS == PLANNER_AGENT_PROMPT:  # 提示词被改动导致替换失效时的兜底
+    _BASE_ALLOWING_TOOLS = PLANNER_AGENT_PROMPT + "\n\n（上文禁止工具调用的约束在工具模式下作废。）"
+
+PLANNER_AGENT_PROMPT_WITH_TOOLS = _BASE_ALLOWING_TOOLS + _TOOL_POLICY
+
+
+# === 改造点：增量修改（多轮会话）提示词 ===
+# 原项目只有"一次性生成"：用户想改一句话（比如第二天改成室内），只能整趟重新生成，
+# 等 60 秒，而且新计划和上一版可能面目全非，用户之前的满意部分被随机改掉。
+# 这里复用同一套 JSON 硬性要求，只把"重新生成"改成"最小改动"。
+_REFINE_POLICY = """
+
+## 增量修改规则（本段优先级高于上文所有"重新生成"类表述）
+
+你不是在重新规划一趟旅行，而是在**修改一份已经存在的计划**。
+你收到的输入包含"上一版旅行计划"和"修改要求"，请按以下规则工作：
+
+1. **最小改动**：只改"修改要求"明确涉及的部分。未提及的天数、景点、餐厅、酒店、金额一律原样保留，包括它们的先后顺序。不要借机"顺便优化"其他内容。
+2. **日期与天数不变**：days 的长度、每天的 date 和 day_index 必须与上一版完全一致。
+3. **新增地点必须有依据**：只能从输入给出的"候选POI池"里选，名称与池中完全一致。池里没有就保持原样，并在 overall_suggestions 里如实说明，禁止自己编一个地点出来。
+4. **改完必须自检**：
+   - budget.total = total_attractions + total_hotels + total_meals + total_transportation；
+   - 每天仍有 breakfast / lunch / dinner 三餐；
+   - weather_info 的日期与行程逐日对应，不改动天气；
+   - 所有 location 是 {"longitude": 数字, "latitude": 数字} 对象。
+5. **价格只能复制**：沿用候选池里的 meal_cost_hint / ticket_price_hint / estimated_cost_hint，不要重新估价。
+6. **说明改动**：overall_suggestions 第一句以"本次已调整："开头，一句话说明改了什么。
+7. 输出仍然是一个完整的 TripPlan JSON 对象，不能是补丁或 diff，也不能带 Markdown 代码块或解释文字。
+"""
+
+PLANNER_REFINE_PROMPT = _BASE_ALLOWING_TOOLS + _REFINE_POLICY

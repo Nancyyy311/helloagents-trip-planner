@@ -1,6 +1,9 @@
 """PlannerContext 构造逻辑。"""
 
+import copy
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict
 
@@ -53,6 +56,110 @@ FOOD_CONTEXT_MIN_BY_BUDGET_LEVEL = {
     "luxury": 180,
 }
 
+# === 改造点：PlannerContext 进程级 TTL 缓存 ===
+# 原实现每次请求都实时调用高德（景点/天气/酒店 10~20 次），重复请求完全不复用。
+# 这里加一个进程级、线程安全的 TTL 缓存（默认 30 分钟），单机够用，不引入 Redis。
+# 批次3 补充两点：
+#   1) 加容量上限（默认 128 条）：TTL 只保证"过期会失效"，不限制"总量"，
+#      不同城市/日期组合多起来会一直涨；超限时先清过期，再按访问顺序淘汰最旧（LRU）。
+#   2) 统计 hits/misses：缓存有没有用不能靠感觉，要靠命中率说话。
+PLANNER_CONTEXT_CACHE_TTL = int(os.getenv("PLANNER_CONTEXT_CACHE_TTL", "1800"))
+PLANNER_CONTEXT_CACHE_MAXSIZE = int(os.getenv("PLANNER_CONTEXT_CACHE_MAXSIZE", "128"))
+
+
+class _TTLCache:
+    """线程安全的 TTL + LRU 容量上限缓存；get 返回深拷贝，避免调用方改坏缓存。"""
+
+    def __init__(self, ttl_seconds: int, maxsize: int = 128) -> None:
+        self._ttl = ttl_seconds
+        self._maxsize = max(1, maxsize)
+        self._store: Dict[Any, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def get(self, key: Any) -> Any:
+        with self._lock:
+            item = self._store.get(key)
+            if item is None:
+                self.misses += 1
+                return None
+            expires_at, value = item
+            if time.time() >= expires_at:
+                self._store.pop(key, None)
+                self.misses += 1
+                return None
+            # dict 本身按插入顺序保存；pop + 重新插入 = 把该 key 移到"最新"位置，
+            # 这样插入顺序就等价于访问顺序，淘汰时从头部拿到的就是最久未使用的。
+            self._store[key] = self._store.pop(key)
+            self.hits += 1
+            return copy.deepcopy(value)
+
+    def set(self, key: Any, value: Any) -> None:
+        with self._lock:
+            now = time.time()
+            if len(self._store) >= self._maxsize:
+                # 先清掉已过期的（不占容量）
+                expired = [k for k, (exp, _) in self._store.items() if now >= exp]
+                for k in expired:
+                    self._store.pop(k, None)
+                    self.evictions += 1
+            # 仍然超限：按"最久未使用"淘汰，直到腾出位置
+            while len(self._store) >= self._maxsize:
+                oldest = next(iter(self._store))
+                if oldest == key:
+                    break
+                self._store.pop(oldest, None)
+                self.evictions += 1
+            self._store[key] = (now + self._ttl, copy.deepcopy(value))
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "size": len(self._store),
+                "maxsize": self._maxsize,
+                "ttl_seconds": self._ttl,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": round(self.hits / total, 4) if total else 0.0,
+                "evictions": self.evictions,
+            }
+
+
+_context_cache = _TTLCache(PLANNER_CONTEXT_CACHE_TTL, PLANNER_CONTEXT_CACHE_MAXSIZE)
+
+
+def context_cache_stats() -> Dict[str, Any]:
+    """暴露缓存运行状态（供 /metrics 使用，不暴露缓存内容）。"""
+    return _context_cache.stats()
+
+
+def _context_cache_key(request: TripRequest) -> tuple:
+    """用与结果相关的请求字段拼缓存键（忽略无关字段）。"""
+    party = request.party
+    budget = request.budget_constraint
+    return (
+        request.city,
+        request.start_date,
+        request.end_date,
+        request.travel_days,
+        request.transportation,
+        request.accommodation,
+        tuple(request.preferences or []),
+        party.adults,
+        party.children,
+        party.elders,
+        party.total,
+        party.companion_type,
+        budget.amount,
+        budget.budget_level,
+        budget.strictness,
+        request.free_text_input or "",
+    )
+
+
 class PlannerContextBuilder:
     """构造最终 Planner 使用的结构化上下文。"""
 
@@ -60,7 +167,13 @@ class PlannerContextBuilder:
         self.amap_client = AmapPlannerClient(amap_api_key)
 
     def collect(self, request: TripRequest) -> Dict[str, Any]:
-        """并行获取 Planner 所需的结构化上下文。"""
+        """并行获取 Planner 所需的结构化上下文（带进程级 TTL 缓存）。"""
+        cache_key = _context_cache_key(request)
+        cached = _context_cache.get(cache_key)
+        if cached is not None:
+            print("♻️  命中 PlannerContext 缓存，跳过高德调用", flush=True)
+            return cached
+
         context = self.empty_context(request)
         jobs = {
             "attractions": self._collect_attraction_snapshot,
@@ -91,6 +204,7 @@ class PlannerContextBuilder:
             True,
             "disabled; planner uses poi address/district/location",
         )
+        _context_cache.set(cache_key, context)
         return context
 
     def empty_context(self, request: TripRequest) -> Dict[str, Any]:

@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any, Dict
 
-from ..models.schemas import TripRequest
+from ..models.schemas import TripPlan, TripRequest
 
 
 PLANNER_OUTPUT_BASE_TOKENS = int(os.getenv("PLANNER_OUTPUT_BASE_TOKENS", "3000"))
@@ -49,3 +49,92 @@ def planner_max_output_tokens(request: TripRequest) -> int:
         PLANNER_OUTPUT_BASE_TOKENS + request.travel_days * PLANNER_OUTPUT_TOKENS_PER_DAY,
         PLANNER_MAX_OUTPUT_TOKENS_CAP,
     )
+
+
+# 候选池里对"改行程"真正有用的字段。id/typecode/photo 之类对修改没有帮助，
+# 带上只会把 prompt 撑长、增加模型跑偏的概率。
+_POOL_KEYS = (
+    "name",
+    "address",
+    "district",
+    "location",
+    "ticket_price_hint",
+    "estimated_cost_hint",
+    "meal_cost_hint",
+    "type",
+)
+
+
+def build_refine_query(
+    request: TripRequest,
+    previous_plan: TripPlan,
+    instruction: str,
+    planner_context: Dict[str, Any],
+) -> str:
+    """构建"增量修改"的输入：上一版计划 + 修改要求 + 候选池。
+
+    为什么带候选池：用户可能要求"加一个小众园林"，如果不给候选池，
+    模型只能凭记忆编一个 —— 这正是我们要防的幻觉。带了候选池，
+    它在"新增"时也有据可依，编不出来就该如实说明。
+    """
+    plan_payload = previous_plan.model_dump(mode="json", exclude={"grounding"})
+    plan_json = json.dumps(plan_payload, ensure_ascii=False, separators=(",", ":"))
+
+    snapshot = (planner_context or {}).get("tool_snapshot") or {}
+    pool_json = json.dumps(
+        {
+            "scenic_pois": _compact_pool(
+                (snapshot.get("scenic_pois") or [])
+                + (snapshot.get("preference_pois") or [])
+                + (snapshot.get("classic_pois") or [])
+                + (snapshot.get("experience_pois") or [])
+            ),
+            "food_pois": _compact_pool(snapshot.get("food_pois") or []),
+            "hotel_pois": _compact_pool(snapshot.get("hotel_pois") or []),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    print(
+        f"增量修改输入: 计划 {len(plan_json)} 字符, 候选池 {len(pool_json)} 字符",
+        flush=True,
+    )
+
+    return f"""请基于下面的"上一版旅行计划"，按"修改要求"做最小改动，输出一份新的完整 TripPlan JSON。
+
+上一版旅行计划:
+{plan_json}
+
+修改要求: {instruction}
+
+可用的真实候选POI池（新增景点/餐厅/酒店时只能从这里选）:
+{pool_json}
+
+必须遵守:
+1. 只改"修改要求"涉及的部分。未提及的天数、景点、餐饮、酒店必须原样保留（名称、顺序、金额都不变），不要顺手"优化"其他天。
+2. 输出是一份完整的 TripPlan JSON（不是补丁、不是 diff），顶层字段必须包含 city/start_date/end_date/days/weather_info/overall_suggestions/budget。
+3. days 长度必须等于 {request.travel_days}，day_index 从 0 开始，date 必须与上一版逐日一致，不要改动日期。
+4. 需要新增地点时只能用候选POI池里的地点，名称必须与池中完全一致；池里没有符合要求的就保持原样，并在 overall_suggestions 里说明"候选池中没有符合要求的地点"，禁止编造。
+5. 改完后重新核对：budget.total 必须等于 total_attractions+total_hotels+total_meals+total_transportation；每天必须有 breakfast/lunch/dinner 三餐；weather_info 日期与行程逐日对应。
+6. 价格字段必须复制候选池里的 hint（meal_cost_hint / ticket_price_hint / estimated_cost_hint），不能自己估。
+7. overall_suggestions 的第一句用"本次已调整："开头，说明改了什么，方便前端直接展示。
+8. 只返回一个合法 JSON 对象，不要 Markdown 代码块、解释、前言或工具调用标记。
+"""
+
+
+def _compact_pool(rows: list, limit: int = 40) -> list:
+    """裁剪候选字段并去重，控制 prompt 长度。"""
+    seen = set()
+    result = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        item = {key: row[key] for key in _POOL_KEYS if row.get(key) not in (None, "")}
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result

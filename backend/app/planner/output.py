@@ -231,41 +231,158 @@ def extract_json_object(response: str) -> Dict[str, Any]:
 
     这里不要从任意内层 `{` 开始扫描。顶层 JSON 被截断时，内层
     day/hotel/attraction 对象可能仍然是合法 JSON，但它不是 TripPlan。
+
+    批次4 强化（原实现太脆，实测中大量"输出解析失败"都栽在这四个坑上）：
+    1. 原实现要求候选片段**以 `{` 开头**——模型只要说一句"好的，以下是行程："
+       就整段失效；
+    2. 原实现要求 JSON 后面**不能有任何文字**——模型加一句"希望对你有帮助"
+       就整段失效；
+    3. 不支持**尾逗号**（`{"a":1,}`），这是模型最常见的语法错误；
+    4. 不支持**截断后的补全**（max_tokens 用满时 JSON 会被切在半路）。
+    现在的策略：先按原样找，找不到就做一次保守修复再找，仍失败才抛错。
+    """
+    text = _normalize_response_text(response)
+
+    for segment in _json_candidate_segments(text):
+        found = _first_trip_plan_dict(segment)
+        if found is not None:
+            _record_parse("success")
+            return found
+
+        repaired = _repair_json_candidate(segment)
+        if repaired:
+            found = _first_trip_plan_dict(repaired)
+            if found is not None:
+                _record_parse("repaired")
+                return found
+
+    _record_parse("failed")
+    raise ValueError("响应中未找到完整的顶层TripPlan JSON对象")
+
+
+# TripPlan 必须具备的顶层字段；内层 day/hotel 对象不会有这些键，
+# 所以"扫到的第一个满足条件的 dict"天然就是顶层对象。
+REQUIRED_TRIP_PLAN_KEYS = {"city", "start_date", "end_date", "days", "overall_suggestions"}
+
+# 零宽字符/BOM 会粘在 `{` 前面，导致 startswith 判断和 json 解码都失败
+_INVISIBLE_CHARS_RE = re.compile(r"[\ufeff\u200b\u200c\u200d\u2060]")
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+# 轻量解析统计：解析失败是"看不见的成本"（每次失败都要重跑一次 40 秒的 LLM 调用），
+# 必须能通过 /metrics 看到，否则优化无从验证。
+_PARSE_STATS = {"attempts": 0, "success": 0, "repaired": 0, "failed": 0}
+
+
+def _record_parse(outcome: str) -> None:
+    _PARSE_STATS["attempts"] += 1
+    _PARSE_STATS[outcome] += 1
+
+
+def output_parse_stats() -> Dict[str, int]:
+    """供 /metrics 读取的解析统计（成功 / 靠修复救回 / 彻底失败）。"""
+    return dict(_PARSE_STATS)
+
+
+def _normalize_response_text(response: str) -> str:
+    """去掉 BOM 和零宽字符，避免它们黏在 `{` 前面导致解析失败。"""
+    return _INVISIBLE_CHARS_RE.sub("", str(response or ""))
+
+
+def _json_candidate_segments(text: str) -> List[str]:
+    """按"可信度从高到低"给出待解析片段：代码块 -> 全文。"""
+    segments: List[str] = []
+
+    for match in re.finditer(r"```(?:json|JSON)?\s*(.*?)```", text, re.S):
+        block = match.group(1).strip()
+        if block:
+            segments.append(block)
+
+    stripped = text.strip()
+    if stripped and stripped not in segments:
+        segments.append(stripped)
+
+    return segments
+
+
+def _first_trip_plan_dict(segment: str) -> Optional[Dict[str, Any]]:
+    """在片段里找第一个"满足顶层字段"的 JSON 对象。
+
+    从每个 `{` 依次尝试解码，而不是只要求整段以 `{` 开头：
+    这样"前缀说明文字 + JSON + 后缀说明文字"也能被正确提取。
     """
     decoder = json.JSONDecoder()
-    candidates = []
-
-    if "```json" in response:
-        json_start = response.find("```json") + 7
-        json_end = response.find("```", json_start)
-        if json_end != -1:
-            candidates.append(response[json_start:json_end].strip())
-
-    if "```" in response:
-        json_start = response.find("```") + 3
-        json_end = response.find("```", json_start)
-        if json_end != -1:
-            candidates.append(response[json_start:json_end].strip())
-
-    candidates.append(response.strip())
-
-    for candidate in candidates:
-        candidate = candidate.strip()
-        if not candidate.startswith("{"):
-            continue
+    index = 0
+    while True:
+        start = segment.find("{", index)
+        if start == -1:
+            return None
         try:
-            data, end_index = decoder.raw_decode(candidate)
+            data, _end = decoder.raw_decode(segment, start)
         except json.JSONDecodeError:
+            index = start + 1
             continue
-        trailing_text = candidate[end_index:].strip()
-        if trailing_text:
-            continue
-        if isinstance(data, dict):
-            required_keys = {"city", "start_date", "end_date", "days", "overall_suggestions"}
-            if required_keys.issubset(data.keys()):
-                return data
+        if isinstance(data, dict) and REQUIRED_TRIP_PLAN_KEYS.issubset(data.keys()):
+            return data
+        index = start + 1
 
-    raise ValueError("响应中未找到完整的顶层TripPlan JSON对象")
+
+def _repair_json_candidate(segment: str) -> Optional[str]:
+    """对片段做一次保守修复：裁掉前后废话、去尾逗号、统一引号、补全被截断的括号。
+
+    只做"几乎不可能改坏语义"的操作；修不好就返回 None，交给下一段候选。
+    """
+    start = segment.find("{")
+    if start == -1:
+        return None
+    body = segment[start:]
+
+    # 统一成 ASCII 引号：合法 JSON 里本来就不会出现中文引号，
+    # 模型却经常把 " 写成 “ ”，这是高频失败原因。
+    body = body.replace("“", '"').replace("”", '"')
+    body = _TRAILING_COMMA_RE.sub(r"\1", body)
+
+    closed = _close_truncated_json(body)
+    if closed is None:
+        return None
+    # 再清一次：补全后可能又出现 ",}" 这种结构
+    return _TRAILING_COMMA_RE.sub(r"\1", closed)
+
+
+def _close_truncated_json(text: str) -> Optional[str]:
+    """把被 max_tokens 截断的 JSON 补全成合法结构。
+
+    扫描时正确跳过字符串内部（含转义），遇到不匹配的右括号则认为结构已损坏，返回 None。
+    """
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                return None
+            stack.pop()
+
+    if in_string:
+        text += '"'
+    if not stack:
+        return text
+    return text + "".join(reversed(stack))
 
 
 def validate_trip_plan_shape(
@@ -308,7 +425,28 @@ def validate_trip_plan_shape(
 
 
 def warn_plan_grounding(trip_plan: TripPlan, planner_context: Dict[str, Any]) -> None:
-    """对POI是否来自工具候选做软检查；先不硬拦，避免高德召回缺口导致线上不可用。"""
+    """对POI是否来自工具候选做软检查；先不硬拦，避免高德召回缺口导致线上不可用。
+
+    改造点：如果 grounding 模块已经算过（trip_plan.grounding 存在），直接复用结果。
+    原项目这里和 rerank、enrich 各算了一套，三处口径不一致；现在统一由
+    planner.grounding 产出，这里只负责打印，不再重复遍历。
+
+    注意：本文件不能 import grounding（会形成循环导入），
+    因此只读取模型上已经挂好的 summary 字段。
+    """
+    summary = getattr(trip_plan, "grounding", None)
+    if summary is not None:
+        if summary.unverified_attractions:
+            preview = ", ".join(summary.unverified_attractions[:5])
+            print(f"⚠️  Planner输出中有未命中工具候选的景点: {preview}")
+        if summary.unverified_hotels:
+            preview = ", ".join(summary.unverified_hotels[:3])
+            print(f"⚠️  Planner输出中有未命中工具候选的酒店: {preview}")
+        if summary.unverified_meals:
+            preview = ", ".join(summary.unverified_meals[:5])
+            print(f"⚠️  Planner输出中有未命中餐饮候选的餐饮: {preview}")
+        return
+
     snapshot = planner_context.get("tool_snapshot", {})
     scenic_names = candidate_names(
         (snapshot.get("classic_pois") or [])
