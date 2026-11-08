@@ -48,6 +48,9 @@ htmlcov/
 # 批次11：景点图片磁盘缓存（运行时生成，不入库）
 .cache/
 
+# 批次12：评测运行产物（每次跑都生成，不入库；用例集 training/eval/cases.jsonl 入库）
+training/eval/runs/
+
 # 操作系统
 .DS_Store
 Thumbs.db
