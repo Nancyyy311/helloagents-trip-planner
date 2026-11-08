@@ -424,6 +424,14 @@ class MultiAgentTripPlanner:
         )
         self._log_timer("增量修改 LLM调用", call_started_at)
 
+        # 改造点（批次10）：调用返回后必须再检查一次。
+        # `_call_llm_with_backoff` 只在**发请求之前**检查，一旦请求已经在飞，
+        # 中途取消是拦不住的；如果这里不再查一次，这次调用跑完就会照常返回
+        # 一份"用户其实已经不要了"的计划，取消等于形同虚设（实测：DELETE 后
+        # 仍返回 200，tasks_canceled 一直是 0）。
+        # 已经花掉的那次调用收不回来，但结果不该被当成成功交付。
+        self._checkpoint("after_refine_llm")
+
         trip_plan = self._parse_response(
             response,
             request,

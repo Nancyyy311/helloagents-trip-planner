@@ -445,6 +445,41 @@ def _release_plan(plan_id: str) -> None:
             item["refining"] = False
 
 
+# === 改造点：增量修改也能被取消 ===
+# `/plan` 走任务模型，取消靠 DELETE /plan/async/{id}；refine 是同步接口，
+# 没有 task_id 可寻址。但 `_claim_plan` 已经保证"同一 plan_id 同时只有一轮
+# refine"，所以 plan_id 天然就是这个任务的唯一标识——用它做键，
+# 既不需要新增一套 id 体系，也不会和首次生成的任务表混淆。
+_refine_tokens: dict[str, CancelToken] = {}
+
+
+def _register_refine_token(plan_id: str) -> CancelToken:
+    token = CancelToken()
+    with _plans_lock:
+        _refine_tokens[plan_id] = token
+    return token
+
+
+def _unregister_refine_token(plan_id: str, token: CancelToken) -> None:
+    with _plans_lock:
+        if _refine_tokens.get(plan_id) is token:
+            _refine_tokens.pop(plan_id, None)
+
+
+def cancel_refine(plan_id: str, reason: str = "client_deleted") -> tuple[str, dict | None]:
+    """取消正在跑的增量修改，返回 (结果, token 快照)。
+
+    - `idle`：该 plan 当前没有 refine 在跑（已结束或从没开始）-> 409
+    - `canceling`：已置取消信号，等线程在下一个检查点退出
+    """
+    with _plans_lock:
+        token = _refine_tokens.get(plan_id)
+    if token is None:
+        return "idle", None
+    switched = token.cancel(reason)
+    return ("canceling" if switched else "already_canceling"), token.snapshot()
+
+
 def _load_plan(plan_id: str) -> tuple[TripPlan, TripRequest] | None:
     """按 plan_id 取回 (计划, 原始请求)；不存在或已过期返回 None。"""
     with _plans_lock:
@@ -710,11 +745,25 @@ async def refine_plan(plan_id: str, payload: RefineRequest):
 
     try:
         # 同样用 to_thread：修改也是几十秒的同步阻塞调用。
-        # 和 /plan 一样不做断连探测（原因见 /plan 的注释），
-        # 但 _refine_isolated 已经支持 cancel_token，接上异步任务模型即可复用。
-        new_plan, _status, message = await asyncio.to_thread(
-            _refine_isolated, request, previous_plan, payload.instruction
+        # === 改造点（本批）：refine 也能被取消 ===
+        # 此前这里没传 cancel_token，等于"首次生成能停、改一句话停不了"——
+        # 同样是四十秒的 LLM 调用，用户关掉页面照样跑完照扣钱。
+        # 令牌按 plan_id 注册，客户端用 DELETE /plan/{plan_id}/refine 触发。
+        refine_token = _register_refine_token(plan_id)
+        try:
+            new_plan, _status, message = await asyncio.to_thread(
+                _refine_isolated, request, previous_plan, payload.instruction, refine_token
+            )
+        finally:
+            _unregister_refine_token(plan_id, refine_token)
+    except PlanCancelled as exc:
+        # 取消不是失败：原计划没有被改动，如实告诉调用方"已取消、原计划完好"
+        metrics.record_task_canceled(exc.reason, exc.stage)
+        print(
+            f"⏹️  增量修改已取消: stage={exc.stage} reason={exc.reason}（原计划未受影响）",
+            flush=True,
         )
+        raise HTTPException(status_code=499, detail="增量修改已取消，原计划未受影响")
     except Exception as e:
         print(f"❌ 增量修改失败: {e}")
         import traceback
@@ -742,6 +791,30 @@ async def refine_plan(plan_id: str, payload: RefineRequest):
         data=new_plan,
         diff=diff,
     )
+
+
+@router.delete(
+    "/plan/{plan_id}/refine",
+    summary="取消正在进行的增量修改",
+    description=(
+        "取消一次还没跑完的增量修改。原计划不受影响，调用方可以继续用上一版。"
+        "该 plan 当前没有 refine 在跑时返回 409。"
+    ),
+)
+async def cancel_refine_endpoint(plan_id: str, reason: str = "client_deleted"):
+    """取消正在跑的增量修改。
+
+    为什么需要这个接口：refine 同样是四十秒级的 LLM 调用，此前完全没有
+    中止入口——用户关掉页面、或者想换一句要求重来，前一次调用照样跑完。
+    首次生成有 DELETE /plan/async/{id}，refine 一直没有对应能力，这里补齐。
+    """
+    result, snapshot = cancel_refine(plan_id, reason)
+    if result == "idle":
+        raise HTTPException(
+            status_code=409,
+            detail="该计划当前没有正在进行的修改",
+        )
+    return {"plan_id": plan_id, "cancel": result, "token": snapshot}
 
 
 @router.post(
