@@ -628,7 +628,7 @@ const handleSubmit = async () => {
   border-radius: 8px;
   background:
     linear-gradient(90deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.62)),
-    url('https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1600&q=80') center/cover;
+    url('/api/poi/photo/asset/1500530855697-b586d89ba3ee?w=1600&q=80') center/cover;
   color: #ffffff;
 }
 

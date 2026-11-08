@@ -394,6 +394,38 @@ tasks_canceled: 1  by_stage={'after_refine_llm': 1}
 > 教训重复了一次，值得记下来：**限流必须按"会不会触发 LLM"分档，
 > 不能按路径前缀分档。** 每次新增路由都要问一遍这句话。
 
+### 4.13 「结果页很多都加载不出来」（批次11）
+
+用户真机截图：每日安排大面积空白、地图白板。逐项取证后找到三个独立根因：
+
+1. **Unsplash 搜索 API 在国内网络不可达**（curl 8s 超时），且 `.env` 里
+   `UNSPLASH_ACCESS_KEY` 本来就是空串。`GET /api/poi/photo?name=故宫`
+   实测 **22 秒**、最终 `photo_url: null`——两次 10s 超时全白跑。
+2. **`async def` 路由里跑同步 `requests.get`，阻塞整个事件循环**。
+   结果页 15 个景点并发请求图片，实际串行 15 × 22s ≈ 5 分半；
+   旧后端日志里单次最高 **81.3s**。期间轮询、餐饮坐标回填全部卡死。
+3. **前端没有 `.env` 文件**，`VITE_AMAP_WEB_JS_KEY` 为 undefined，
+   高德 JSAPI 直接加载失败——全程地图/每日地图白屏。
+
+改法（详见 `app/planner/local_photo_table.py` 模块注释）：
+
+- 图片**不搜索、查本地映射表**：11 张人工逐张核验内容的 CDN 直链
+  （images.unsplash.com 图片 CDN 与搜索 API 不同域名，实测可达），
+  按「景点关键词 → 城市 → 无」三级匹配；未命中返回 null，
+  前端退回带景点名的渐变占位卡——宁可不给图，不给错图。
+- **磁盘缓存代理** `GET /api/poi/photo/asset/{photo_id}`：浏览器永远只连
+  localhost；首次下载由服务端重试吸收 CDN 抖动，之后读本地磁盘。
+  只认表内 id，防路径穿越/开放代理。
+- 代理端点**用 `def`（同步路由）**：FastAPI 自动丢线程池执行，
+  下载再慢也不碰事件循环——正是原 bug 的镜像修复。
+
+实测：photo 接口 22s→**0.028s**；图片二次起 **0.007s**；
+图片下载期间 5 连打 healthz 全部毫秒级（旧实现这一场景会卡 10-20s+）。
+测试 151 → **164 passed**。
+
+> 教训：**`async def` 里禁止出现同步阻塞 IO**。这条纪律和"限流按成本分档"
+> 一样，是本项目用真实事故换来的。
+
 ---
 
 ## 5. 接口一览
@@ -412,9 +444,11 @@ tasks_canceled: 1  by_stage={'after_refine_llm': 1}
 | GET | `/healthz` | **存活探针**（永远 200，不检查依赖） |
 | GET | `/readyz` | **就绪探针**（ready / degraded / not_ready 三档） |
 | GET | `/metrics` | 指标快照（含限流/并发/合并/取消计数） |
+| GET | `/api/poi/photo?name=&city=` | **本地图片映射表查询**：命中返回缓存代理地址，未命中返回 null（前端占位卡兜底） |
+| GET | `/api/poi/photo/asset/{photo_id}` | **磁盘缓存代理**：首次从 CDN 拉取落盘，之后直读本地；只认表内 id |
 | GET | `/docs` · `/redoc` | OpenAPI 文档 |
 
-行程相关端点：**2 → 7 个**。
+行程相关端点：**2 → 7 个**；图片端点：**1 → 2 个**（批次11）。
 
 失败语义（全部有据可查，不再一律 500）：
 

@@ -128,6 +128,11 @@
             <a-card id="map" title="全程地图" :bordered="false" class="map-card">
               <div class="map-shell">
                 <div id="amap-container" class="amap-container"></div>
+                <!-- 批次11：地图加载失败时给出明确提示，而不是一块白板 -->
+                <div v-if="mapError" class="map-error-state">
+                  地图加载失败：请检查 .env 中 VITE_AMAP_WEB_JS_KEY（需为「Web端(JS API)」类型）
+                  与 VITE_AMAP_SECURITY_JS_CODE 配置
+                </div>
                 <div class="map-legend">
                   <span><i class="legend-dot legend-hotel"></i>住宿</span>
                   <span><i class="legend-dot legend-attraction"></i>景点</span>
@@ -140,6 +145,9 @@
 
         <!-- 每日地图 -->
         <a-card id="daily-maps" title="每日地图" :bordered="false" class="daily-maps-card">
+          <div v-if="mapError" class="map-error-state compact">
+            地图加载失败：请检查高德 JSAPI Key 与安全密钥配置（见控制台报错）
+          </div>
           <div class="daily-map-grid">
             <div
               v-for="(day, index) in tripPlan.days"
@@ -393,6 +401,8 @@ const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
 const attractionPhotos = ref<Record<string, string>>({})
+// 批次11：高德 JSAPI 加载失败时置位，地图区域展示明确错误说明而非白板
+const mapError = ref(false)
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
 let map: any = null
@@ -578,7 +588,9 @@ const fetchJsonWithTimeout = async (url: string, timeoutMs = 8000): Promise<any>
   }
 }
 
-// 加载所有景点图片
+// 加载所有景点图片。
+// 批次11：带上城市（后端按 景点→城市 两级查本地映射表，命中率更高）；
+// 后端返回的是相对路径的缓存代理地址，需要补 API_BASE_URL 前缀。
 const loadAttractionPhotos = async () => {
   if (!tripPlan.value) return
 
@@ -586,10 +598,15 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      const promise = fetchJsonWithTimeout(`${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
+      const promise = fetchJsonWithTimeout(
+        `${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}&city=${encodeURIComponent(tripPlan.value!.city || '')}`
+      )
         .then(data => {
           if (data.success && data.data.photo_url) {
-            attractionPhotos.value[attraction.name] = data.data.photo_url
+            const url: string = data.data.photo_url
+            attractionPhotos.value[attraction.name] = url.startsWith('/')
+              ? `${API_BASE_URL}${url}`
+              : url
           }
         })
         .catch(err => {
@@ -1321,6 +1338,13 @@ const initDailyMaps = (AMap: any) => {
 const loadAMap = async () => {
   if (AMapApi) return AMapApi
 
+  // 批次11：2021-12 之后申请的高德 key 必须配安全密钥，否则 JSAPI 报
+  // INVALID_USER_SCODE。留空则跳过（老 key / 已在 nginx 层配置的情况）。
+  const securityJsCode = String(import.meta.env.VITE_AMAP_SECURITY_JS_CODE || '').trim()
+  if (securityJsCode) {
+    ;(window as any)._AMapSecurityConfig = { securityJsCode }
+  }
+
   AMapApi = await AMapLoader.load({
     key: import.meta.env.VITE_AMAP_WEB_JS_KEY,
     version: '2.0',
@@ -1338,7 +1362,9 @@ const initMaps = async () => {
     message.success('地图加载成功')
   } catch (error) {
     console.error('地图加载失败:', error)
-    message.error('地图加载失败')
+    // 批次11：不再只弹一个 3 秒就消失的 toast——
+    // 地图区域本身要留下可读的失败说明，否则用户看到的就是"白屏加载不出来"
+    mapError.value = true
   }
 }
 
@@ -1770,6 +1796,29 @@ const destroyMaps = () => {
   color: #64748b;
   font-size: 14px;
   font-weight: 600;
+}
+
+/* 批次11：JSAPI 加载失败的可读提示（替代原来的"白屏 + 3秒 toast"） */
+.map-error-state {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.map-error-state.compact {
+  position: static;
+  margin-bottom: 12px;
+  padding: 10px 14px;
 }
 
 .daily-maps-card {
