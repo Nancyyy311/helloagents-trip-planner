@@ -131,9 +131,28 @@ class _TTLCache:
 _context_cache = _TTLCache(PLANNER_CONTEXT_CACHE_TTL, PLANNER_CONTEXT_CACHE_MAXSIZE)
 
 
+# === 缓存击穿（cache stampede）保护 ===
+# 缓存没命中时，如果多个线程同时进来，它们都会发现"没有"，然后各自打一遍高德
+# （每趟十余次调用）——缓存等于白设。典型场景：两个用户同时查同一城市，
+# 或者一次规划里 3 个候选并行构建上下文。
+#
+# 这里用固定数量的锁"条纹"而不是"每个 key 一把锁"：
+# 前者内存恒定（64 个锁），后者会随 key 数量无限增长；
+# 代价是不同 key 偶尔共用一把锁，只在"未命中"时才会互相等一下，可以接受。
+_CACHE_STRIPES = 64
+_stripe_locks = [threading.Lock() for _ in range(_CACHE_STRIPES)]
+_stampede_waits = 0
+
+
+def _stripe_for(cache_key: tuple) -> threading.Lock:
+    return _stripe_locks[hash(cache_key) % _CACHE_STRIPES]
+
+
 def context_cache_stats() -> Dict[str, Any]:
     """暴露缓存运行状态（供 /metrics 使用，不暴露缓存内容）。"""
-    return _context_cache.stats()
+    stats = _context_cache.stats()
+    stats["stampede_waits"] = _stampede_waits
+    return stats
 
 
 def _context_cache_key(request: TripRequest) -> tuple:
@@ -174,38 +193,48 @@ class PlannerContextBuilder:
             print("♻️  命中 PlannerContext 缓存，跳过高德调用", flush=True)
             return cached
 
-        context = self.empty_context(request)
-        jobs = {
-            "attractions": self._collect_attraction_snapshot,
-            "weather": self._collect_weather_snapshot,
-            "hotels": self._collect_hotel_snapshot,
-        }
+        # 未命中：同 key 只放一个线程去取数，其他线程在这里等它把缓存填好。
+        global _stampede_waits
+        with _stripe_for(cache_key):
+            # 二次检查：等锁期间别人可能已经填好了，此时不该再取一遍
+            cached = _context_cache.get(cache_key)
+            if cached is not None:
+                _stampede_waits += 1
+                print("♻️  等锁期间已被其他请求填好，直接复用", flush=True)
+                return cached
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(func, request): name for name, func in jobs.items()}
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    result = future.result()
-                    context["tool_snapshot"].update(result.get("tool_snapshot", {}))
-                    context["tool_snapshot"]["tool_status"][name] = result.get(
-                        "status",
-                        self._tool_status(True, "ok"),
-                    )
-                except Exception as exc:
-                    context["tool_snapshot"]["tool_status"][name] = self._tool_status(False, str(exc))
-                    print(f"⚠️  {name}工具快照获取失败: {exc}")
+            context = self.empty_context(request)
+            jobs = {
+                "attractions": self._collect_attraction_snapshot,
+                "weather": self._collect_weather_snapshot,
+                "hotels": self._collect_hotel_snapshot,
+            }
 
-        # 当前主线不生成粗糙路线 hint：直接把酒店/景点/餐饮候选的
-        # address、district 和 location 交给 Planner 判断动线。
-        # 真正的路线时间增强后续应接入地图路线 API，并配套缓存和校验。
-        context["tool_snapshot"]["route_hints"] = []
-        context["tool_snapshot"]["tool_status"]["routes"] = self._tool_status(
-            True,
-            "disabled; planner uses poi address/district/location",
-        )
-        _context_cache.set(cache_key, context)
-        return context
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(func, request): name for name, func in jobs.items()}
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        result = future.result()
+                        context["tool_snapshot"].update(result.get("tool_snapshot", {}))
+                        context["tool_snapshot"]["tool_status"][name] = result.get(
+                            "status",
+                            self._tool_status(True, "ok"),
+                        )
+                    except Exception as exc:
+                        context["tool_snapshot"]["tool_status"][name] = self._tool_status(False, str(exc))
+                        print(f"⚠️  {name}工具快照获取失败: {exc}")
+
+            # 当前主线不生成粗糙路线 hint：直接把酒店/景点/餐饮候选的
+            # address、district 和 location 交给 Planner 判断动线。
+            # 真正的路线时间增强后续应接入地图路线 API，并配套缓存和校验。
+            context["tool_snapshot"]["route_hints"] = []
+            context["tool_snapshot"]["tool_status"]["routes"] = self._tool_status(
+                True,
+                "disabled; planner uses poi address/district/location",
+            )
+            _context_cache.set(cache_key, context)
+            return context
 
     def empty_context(self, request: TripRequest) -> Dict[str, Any]:
         """创建空 PlannerContext，工具失败时也保持输入协议稳定。"""
