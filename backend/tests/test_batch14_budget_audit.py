@@ -143,7 +143,23 @@ class TestAggregateAndReport:
         results = [evaluate_plan(_request(600), _plan(700, raw=None))]
         markdown = render_markdown(aggregate(results), results)
         assert "未记录模型原始上报值" in markdown
-        assert "恒真" in markdown  # consistency 字段必须自曝局限
+        # 恒真的百分比不许再出现在报告正文里，避免被当成质量指标引用
+        assert "预算上报一致率" not in markdown
+
+    def test_wiring_alarm_when_normalization_missing(self):
+        """新数据里上报值与重算值不符 = 归一化被摘掉或重算被改坏，必须报警。"""
+        results = [evaluate_plan(_request(600), _plan(700, raw=500))]
+        summary = aggregate(results)
+        assert summary["budget_wiring_ok"] is False
+        markdown = render_markdown(summary, results)
+        assert "预算归一化未生效" in markdown
+
+    def test_no_alarm_when_wiring_intact(self):
+        """归一化正常：total 已被覆盖成重算值，不该出现报警。"""
+        results = [evaluate_plan(_request(600), _plan(1300, raw=500))]
+        summary = aggregate(results)
+        assert summary["budget_wiring_ok"] is True
+        assert "预算归一化未生效" not in render_markdown(summary, results)
 
     def test_report_shows_audit_when_measurable(self):
         results = [evaluate_plan(_request(600), _plan(700, raw=500))]

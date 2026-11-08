@@ -292,7 +292,10 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "structure_pass_rate": _rate([bool(item["structure"]["ok"]) for item in results]),
         "grounding_mean": round(sum(grounding_rates) / len(grounding_rates), 4),
         "grounding_ok_rate": _rate([bool(item["grounding_ok"]) for item in results]),
-        "budget_report_consistent_rate": round(report_consistent_cases / len(results), 4),
+        # 这是"报警"不是"指标"：归一化生效时它必然为 True，值本身没有信息量；
+        # 唯一有用的是它为 False 的那一刻——说明归一化被摘掉或重算逻辑被改坏。
+        # 所以不给百分比，给布尔值，避免一个永远 100% 的数字被误当成质量提升。
+        "budget_wiring_ok": report_consistent_cases == len(results),
         # 下面四项依赖 budget_reported_raw，是"代码纠正了多少"的可信度量。
         # 旧数据没有原始值，raw_available_cases 会提醒读者：这一批度量不到。
         "budget_raw_available_cases": raw_available_cases,
@@ -300,6 +303,7 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "budget_normalized_amount": normalized_amount,
         "budget_hidden_overrun_cases": hidden_overrun_cases,
         "budget_hidden_overrun_max": hidden_overrun_max,
+        "budget_report_consistent_rate": round(report_consistent_cases / len(results), 4),
         "budget_over_rate": round(over_count / len(results), 4),
         "budget_deviation_median": round(median(deviations), 4) if deviations else None,
         "budget_deviation_mean": round(sum(deviations) / len(deviations), 4) if deviations else None,
@@ -310,27 +314,45 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _budget_audit_line(summary: Dict[str, Any]) -> str:
-    """预算纠正审计的一行摘要。
+    """预算纠正审计的一行摘要（含接线报警）。
 
-    为什么单独一行：`budget_report_consistent_rate` 在归一化上线后恒为 100%，
-    它只能证明归一化挂上了。真正说明"代码纠正了多少"的是下面这行。
+    为什么不再输出"预算上报一致率"这个百分比：归一化生效后它恒为 100%，
+    值本身没有信息量。唯一有用的是它为 false 的那一刻——说明归一化被摘掉、
+    或重算逻辑被改坏。所以降级成布尔报警，失败时才出现。
+
     旧数据没有 budget_reported_raw，必须显式说"度量不到"，不能默认成 0。
     """
+    parts: List[str] = []
     cases = int(summary.get("cases") or 0)
     raw_available = int(summary.get("budget_raw_available_cases") or 0)
+    if summary.get("budget_wiring_ok") is False:
+        # 两种可能无法用数据区分：归一化被摘掉，或这批数据本来就早于归一化上线。
+        # 所以文案同时说出两种，别把历史数据误判成线上故障。
+        if raw_available == 0:
+            parts.append(
+                "- ⚠️ 预算归一化未生效（也可能本批数据早于归一化上线）：多份计划的上报总额"
+                "与按单价重算不符；若这是新跑的数据，检查 `normalize_budget()` 是否被摘掉"
+            )
+        else:
+            parts.append(
+                "- ⚠️ **预算归一化未生效**：多份计划的上报总额与按单价重算不符，"
+                "检查 `normalize_budget()` 是否被摘掉、重算逻辑是否被改坏"
+            )
     if raw_available == 0:
-        return (
+        parts.append(
             "- 预算纠正审计：**本批数据未记录模型原始上报值**（旧格式），"
             "无法度量纠正量；需重跑一次或使用 `scripts/audit_budget.py`"
         )
+        return "\n".join(parts)
     normalized = int(summary.get("budget_normalized_cases") or 0)
     amount = int(summary.get("budget_normalized_amount") or 0)
     hidden = int(summary.get("budget_hidden_overrun_cases") or 0)
     hidden_max = int(summary.get("budget_hidden_overrun_max") or 0)
-    return (
+    parts.append(
         f"- 预算纠正审计：**{normalized}/{cases}** 份被代码纠正，累计金额差 **{amount} 元**；"
         f"其中修复前隐藏超支 **{hidden}** 份（最大 **{hidden_max} 元**）"
     )
+    return "\n".join(parts)
 
 
 def render_markdown(summary: Dict[str, Any], results: Sequence[Dict[str, Any]], title: str = "评测报告") -> str:
@@ -344,8 +366,6 @@ def render_markdown(summary: Dict[str, Any], results: Sequence[Dict[str, Any]], 
         f"- POI 真实命中率（均值）：**{summary.get('grounding_mean', 0):.1%}**",
         f"- 预算超支率：**{summary.get('budget_over_rate', 0):.1%}**"
         f"（偏差中位数 {_fmt_pct(summary.get('budget_deviation_median'))}）",
-        f"- 预算上报一致率：**{summary.get('budget_report_consistent_rate', 0):.1%}**"
-        "（上报总额 vs 按单价重算；归一化上线后此值恒真，只作接线检查）",
         _budget_audit_line(summary),
         f"- 约束违反：**{summary.get('constraint_violation_case_rate', 0):.1%}** 的用例"
         f"（共 {summary.get('constraint_violation_total', 0)} 条）",
