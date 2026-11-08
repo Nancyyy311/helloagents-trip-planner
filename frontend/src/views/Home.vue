@@ -454,20 +454,31 @@ const handleSubmit = async () => {
   loadingProgress.value = 0
   loadingStatus.value = '正在初始化...'
 
-  // 模拟进度更新
+  // 进度条本身仍是估算（后端的生成阶段不对外暴露细粒度进度），
+  // 但**状态文案改用服务端真实状态**：任务模型下能明确区分"排队中"和"生成中"，
+  // 比原来一味往前爬的假文案诚实。
+  let serverStatusShown = false
+  const statusText: Record<string, string> = {
+    pending: '⏳ 任务排队中...',
+    running: '📋 正在生成行程计划...',
+    canceling: '⏹️ 正在取消...'
+  }
+
   const progressInterval = setInterval(() => {
     if (loadingProgress.value < 90) {
       loadingProgress.value += 10
 
-      // 更新状态文本
-      if (loadingProgress.value <= 30) {
-        loadingStatus.value = '🔍 正在搜索景点...'
-      } else if (loadingProgress.value <= 50) {
-        loadingStatus.value = '🌤️ 正在查询天气...'
-      } else if (loadingProgress.value <= 70) {
-        loadingStatus.value = '🏨 正在推荐酒店...'
-      } else {
-        loadingStatus.value = '📋 正在生成行程计划...'
+      // 只有服务端还没给过状态时才用估算文案
+      if (!serverStatusShown) {
+        if (loadingProgress.value <= 30) {
+          loadingStatus.value = '🔍 正在搜索景点...'
+        } else if (loadingProgress.value <= 50) {
+          loadingStatus.value = '🌤️ 正在查询天气...'
+        } else if (loadingProgress.value <= 70) {
+          loadingStatus.value = '🏨 正在推荐酒店...'
+        } else {
+          loadingStatus.value = '📋 正在生成行程计划...'
+        }
       }
     }
   }, 500)
@@ -500,7 +511,15 @@ const handleSubmit = async () => {
       }
     }
 
-    const response = await generateTripPlan(requestData)
+    const response = await generateTripPlan(requestData, {
+      onStatus: (status) => {
+        const text = statusText[status]
+        if (text) {
+          serverStatusShown = true
+          loadingStatus.value = text
+        }
+      }
+    })
 
     clearInterval(progressInterval)
     loadingProgress.value = 100

@@ -109,4 +109,6 @@ export interface TripPlanResponse {
   success: boolean
   message: string
   data?: TripPlan
+  /** 增量修改的凭据：拿着它可以把"改一句话"发给 /plan/{plan_id}/refine */
+  plan_id?: string
 }
