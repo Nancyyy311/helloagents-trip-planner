@@ -52,9 +52,11 @@ class LimitConfig:
     """
 
     enabled: bool = True
-    # 规划类：一次请求贵在 3 个候选的 LLM 调用，桶给得很小
+    # 规划类：一次请求贵在 3 个候选的 LLM 调用，桶给得很小。
+    # burst=4 是算出来的，不是拍的：一次自然的会话是"生成(2) + 改两句(1+1)"=4。
+    # 之前是 3，配上"refine 也扣 2"的旧逻辑，用户改第二下必然 429（实测）。
     plan_per_minute: int = 6
-    plan_burst: int = 3
+    plan_burst: int = 4
     # 其他接口：图片、POI 搜索、健康检查这类，只防刷不防正常使用
     default_per_minute: int = 120
     default_burst: int = 60
@@ -71,7 +73,7 @@ class LimitConfig:
 CONFIG = LimitConfig(
     enabled=_env_flag("RATE_LIMIT_ENABLED", True),
     plan_per_minute=_env_int("RATE_LIMIT_PLAN_PER_MINUTE", 6),
-    plan_burst=_env_int("RATE_LIMIT_PLAN_BURST", 3),
+    plan_burst=_env_int("RATE_LIMIT_PLAN_BURST", 4),
     default_per_minute=_env_int("RATE_LIMIT_DEFAULT_PER_MINUTE", 120),
     default_burst=_env_int("RATE_LIMIT_DEFAULT_BURST", 60),
     poll_per_minute=_env_int("RATE_LIMIT_POLL_PER_MINUTE", 240),
@@ -173,9 +175,15 @@ def classify(path: str, method: str = "GET") -> Optional[str]:
     而前端为了显示进度每 1.2 秒就要轮询一次：**每次生成第 2 次轮询就被 429**，
     用户看到的是"请求过于频繁"而不是"正在生成"。实测复现见 README 4.9。
 
+    改造点（批次10）：**取消 refine 的 DELETE 也被误判成规划档。**
+    同一类错误换了个位置——`DELETE /plan/{plan_id}/refine`（取消增量修改）
+    不产生任何 LLM 调用，却被扣了 2 个令牌。实测：生成一次（扣 2）后
+    再发一次取消，直接 429，取消请求根本到不了业务代码。
+
     判断依据改成"这次请求会不会触发 LLM 调用"：
     - POST /plan、POST /plan/async、POST /plan/{id}/refine -> plan（严格）
-    - GET /plan/async/{id}、GET /plan/async/{id}/stream、DELETE -> poll（宽松）
+    - GET /plan/async/{id}、GET .../stream、DELETE /plan/async/{id}、
+      DELETE /plan/{id}/refine -> poll（宽松）
     """
     if path in EXEMPT_PATHS:
         return None
@@ -185,11 +193,37 @@ def classify(path: str, method: str = "GET") -> Optional[str]:
     # 任务读接口：轮询 1.2s 一次、SSE 长连接、取消请求，都不产生 LLM 调用。
     # 注意要多带一个 "/"：`/api/trip/plan/async` 本身是"提交任务"（POST），
     # 属于最贵的那一档，只有它下面的 /{task_id} 才是纯读。
-    if method.upper() != "POST" and path.startswith(TASK_READ_PREFIX + "/"):
-        return "poll"
+    if method.upper() != "POST":
+        if path.startswith(TASK_READ_PREFIX + "/"):
+            return "poll"
+        # 取消增量修改：同样只是给正在跑的线程置一个标志，零 LLM 成本
+        if path.startswith(PLAN_PREFIX) and path.endswith("/refine"):
+            return "poll"
     if path in PLAN_PATHS or path.startswith(PLAN_PREFIX):
         return "plan"
     return "default"
+
+
+def is_refine_path(path: str) -> bool:
+    """是不是"增量修改"（单次 LLM 调用），用于区分扣费额度。"""
+    return path.startswith(PLAN_PREFIX) and path.endswith("/refine")
+
+
+def charge_amount(path: str, tier: str) -> float:
+    """这次请求要扣几个令牌 —— 按**真实 LLM 成本**折算，而不是按档位一刀切。
+
+    - 首次生成：3 个候选各 1 次调用（rerank 模式），扣 2 个令牌；
+    - 增量修改：只跑 1 次调用，扣 1 个。
+
+    为什么必须区分：默认 `plan_burst=3`，如果两者都扣 2，
+    "生成一次 + 改一句话"= 4 > 3 —— 用户改第二下就被自己的限流挡住。
+    实测复现：生成成功后立刻 refine，返回 429，一次正常的"生成完微调"
+    流程走不通。扣费对齐成本之后，"生成 + 改两次"正好 2+1+1=4，
+    配合把 burst 提到 4 就能覆盖一次自然的会话。
+    """
+    if tier == "plan":
+        return 1.0 if is_refine_path(path) else 2.0
+    return 1.0
 
 
 def check(client_ip: str, tier: str, amount: float = 1.0):
@@ -226,9 +260,9 @@ class RateLimitMiddleware:
             return
 
         ip = client_ip_from_scope(scope)
-        # 规划接口一次请求就值 3 次 LLM 调用，扣 2 个令牌；
-        # 普通接口扣 1 个。用令牌数而不是再加一档配置，少一个旋钮。
-        amount = 2.0 if tier == "plan" else 1.0
+        # 按真实成本扣令牌：首次生成 2 个（3 候选），增量修改 1 个（单次调用），
+        # 其余 1 个。见 charge_amount() 的注释——一刀切会让"生成完微调"直接 429。
+        amount = charge_amount(path, tier)
         allowed, retry_after, remaining = check(ip, tier, amount)
 
         if not allowed:

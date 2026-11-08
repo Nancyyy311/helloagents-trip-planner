@@ -90,13 +90,39 @@ def test_bucket_never_exceeds_capacity():
 # === 档位划分 ===
 
 def test_classify_tiers():
-    assert guard.classify("/api/trip/plan") == "plan"
-    assert guard.classify("/api/trip/plan/async") == "plan"
-    assert guard.classify("/api/trip/plan/abc123/refine") == "plan"
+    assert guard.classify("/api/trip/plan", "POST") == "plan"
+    assert guard.classify("/api/trip/plan/async", "POST") == "plan"
+    assert guard.classify("/api/trip/plan/abc123/refine", "POST") == "plan"
     assert guard.classify("/api/poi/photo") == "default"
     # 探活被限流会被负载均衡直接摘节点，必须豁免
     assert guard.classify("/health") is None
     assert guard.classify("/docs") is None
+
+
+def test_classify_cancel_and_poll_are_cheap():
+    """取消和轮询都不产生 LLM 调用，必须走宽松档。
+
+    这两条都是实测抓到的回归：
+    - 轮询：前端 1.2s 一次，被规划档（6/min）打死，第 2 次就 429；
+    - 取消 refine：DELETE 被当成规划档扣 2 个令牌，生成一次后再取消直接 429，
+      取消请求根本到不了业务代码。
+    """
+    assert guard.classify("/api/trip/plan/async/abc123", "GET") == "poll"
+    assert guard.classify("/api/trip/plan/async/abc123/stream", "GET") == "poll"
+    assert guard.classify("/api/trip/plan/async/abc123", "DELETE") == "poll"
+    assert guard.classify("/api/trip/plan/abc123/refine", "DELETE") == "poll"
+
+
+def test_charge_amount_matches_real_llm_cost():
+    """扣费要按真实成本：首次生成 3 候选扣 2，增量修改单次调用扣 1。
+
+    一刀切扣 2 会让"生成一次 + 改一句话"= 4 > burst，第二下必 429（实测）。
+    """
+    assert guard.charge_amount("/api/trip/plan", "plan") == 2.0
+    assert guard.charge_amount("/api/trip/plan/async", "plan") == 2.0
+    assert guard.charge_amount("/api/trip/plan/abc/refine", "plan") == 1.0
+    assert guard.charge_amount("/api/trip/plan/async/abc", "poll") == 1.0
+    assert guard.charge_amount("/api/poi/photo", "default") == 1.0
 
 
 def test_classify_covers_every_real_health_path():
