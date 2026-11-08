@@ -42,10 +42,19 @@ class MetricsRegistry:
         self.tool_failures = 0
         self.tool_calls_by_name: dict[str, int] = defaultdict(int)
         self.tool_budget_exhausted = 0
+        # 输出预算指标：推理模型会把思考 token 算进 completion_tokens，
+        # 也就占用 max_tokens。不单独看这一项，就无法解释"输出为什么没写完"。
+        self.llm_completion_tokens = 0
+        self.llm_reasoning_tokens = 0
+        self.llm_truncated = 0
         # 候选质量指标：目标生成 3 个候选，实际有效几个
         self.candidate_target = 0
         self.candidate_valid = 0
         self.candidate_shortfall = 0
+        # 解析失败归因：按病因分开计数。
+        # 只记"失败了几次"没用——截断要调输出预算，schema 不合法才该改 prompt，
+        # 混在一起统计会一直把优化方向带偏。
+        self.planner_failures_by_kind: dict[str, int] = defaultdict(int)
         # Grounding 指标：模型编造了多少 POI / 坐标
         self.grounding_checked = 0
         self.grounding_verified = 0
@@ -80,6 +89,21 @@ class MetricsRegistry:
             if not ok:
                 self.llm_failures += 1
 
+    def record_llm_usage(self, meta) -> None:
+        """记录一次调用的 token 用量与截断情况。
+
+        `reasoning_share` 是这轮排障的关键指标：它一旦接近 1，说明额度全被
+        思考吃掉了，正文必然写不完，此时该关思考或加大 max_tokens，
+        而不是去改 prompt。
+        """
+        if meta is None:
+            return
+        with self._lock:
+            self.llm_completion_tokens += getattr(meta, "completion_tokens", 0) or 0
+            self.llm_reasoning_tokens += getattr(meta, "reasoning_tokens", 0) or 0
+            if getattr(meta, "finish_reason", None) == "length":
+                self.llm_truncated += 1
+
     def record_tool(self, name: str, ok: bool) -> None:
         """记录一次工具调用结果。"""
         with self._lock:
@@ -104,6 +128,11 @@ class MetricsRegistry:
             self.candidate_valid += valid
             if valid < target:
                 self.candidate_shortfall += 1
+
+    def record_planner_failure(self, kind: str) -> None:
+        """记录一次 Planner 解析失败的病因（见 planner/failure_kind.py）。"""
+        with self._lock:
+            self.planner_failures_by_kind[kind or "unknown"] += 1
 
     def record_grounding(self, summary) -> None:
         """记录一次 Grounding 校验结果（模型编造率）。
@@ -169,6 +198,17 @@ class MetricsRegistry:
                 "llm_calls": self.llm_calls,
                 "llm_failures": self.llm_failures,
                 "llm_success_rate": round(llm_success_rate, 4),
+                # 改造点：输出预算是否被"思考"吃掉。推理 token 计入
+                # completion_tokens 后，正文就容易半路被切断。
+                "llm_completion_tokens": self.llm_completion_tokens,
+                "llm_reasoning_tokens": self.llm_reasoning_tokens,
+                "llm_reasoning_share": round(
+                    self.llm_reasoning_tokens / self.llm_completion_tokens
+                    if self.llm_completion_tokens
+                    else 0.0,
+                    4,
+                ),
+                "llm_truncated": self.llm_truncated,
                 # 改造点：工具调用指标——证明 Agent 真的在调工具，而不是"伪 Agent"
                 "tool_calls": self.tool_calls,
                 "tool_failures": self.tool_failures,
@@ -180,6 +220,9 @@ class MetricsRegistry:
                 "candidate_valid": self.candidate_valid,
                 "candidate_valid_rate": round(candidate_valid_rate, 4),
                 "candidate_shortfall": self.candidate_shortfall,
+                # 改造点：把解析失败按病因拆开。`truncated_*` 说明输出没写完
+                # （该调 max_tokens 或压缩输出），`schema_invalid` 才是 prompt 问题。
+                "planner_failures_by_kind": dict(self.planner_failures_by_kind),
                 # 改造点：Grounding——模型编造 POI 的比例，是 Agent 落地最关键的质检指标
                 "grounding_checked": self.grounding_checked,
                 "grounding_verified": self.grounding_verified,
