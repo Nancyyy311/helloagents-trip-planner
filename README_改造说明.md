@@ -640,6 +640,17 @@ curl -X POST http://localhost:7000/api/trip/plan/<plan_id>/refine \
 
 > 前端为什么原本是 0 测试：展示逻辑和 Vue 状态写在同一个 2000 行组件里，闭包在 `<script setup>` 内，技术上无法脱离浏览器 import。批次15 把 8 个纯函数抽到 `src/utils/planView.ts` 之后才具备可测性——**先重构，再谈覆盖率**，不是补测试凑数字。
 
+### 一条命令核对全部结论
+
+```bash
+cd backend
+./venv/Scripts/python.exe scripts/healthcheck.py --full
+```
+
+跑完输出 12 项结论（有/无 `.env` 两轮后端测试、前端测试与构建、编译、git 历史密钥、空断言测试、未使用导入、预算审计可复现等），**有 FAIL 时退出码为 1**。加 `--full` 才跑 `vue-tsc` + `vite build`（约 35 秒），不加约 23 秒。
+
+存在的理由：前面几批我至少犯过一次"以为验过、其实没验"（声称 216 个测试全离线，删掉 `.env` 就红 2 条）。口头结论不可核验，所以把验收动作固化成脚本，任何人 clone 下来都能自己跑。脚本自身也做过注入验证——塞一个无断言的测试进去，它必须报 FAIL 并返回退出码 1。
+
 ---
 
 ## 9. 已知短板（不做粉饰）
