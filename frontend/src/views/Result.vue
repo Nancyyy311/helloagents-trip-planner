@@ -383,8 +383,8 @@ import {
   WalletOutlined
 } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import html2canvas from 'html2canvas'
-import jsPDF from 'jspdf'
+// 改造点：html2canvas / jsPDF 改成使用时才动态加载（见 exportAsImage / exportAsPDF）。
+// 原来顶层 import 会把它们打进首屏主包，等于让所有访客为一个"导出"按钮付费。
 import type { TripPlan } from '@/types'
 import { API_BASE_URL } from '@/services/api'
 
@@ -716,6 +716,9 @@ const exportAsImage = async () => {
   try {
     message.loading({ content: '正在生成图片...', key: 'export', duration: 0 })
 
+    // 改造点：按需加载。只有真正点"导出图片"时才下载这个库（约 200KB）。
+    const { default: html2canvas } = await import('html2canvas')
+
     const element = document.querySelector('.main-content') as HTMLElement
     if (!element) {
       throw new Error('未找到内容元素')
@@ -842,6 +845,12 @@ const exportAsImage = async () => {
 const exportAsPDF = async () => {
   try {
     message.loading({ content: '正在生成PDF...', key: 'export', duration: 0 })
+
+    // 改造点：按需加载。两个库加起来接近 1MB，绝大多数用户从不点导出。
+    const [{ default: html2canvas }, { default: jsPDF }] = await Promise.all([
+      import('html2canvas'),
+      import('jspdf')
+    ])
 
     const element = document.querySelector('.main-content') as HTMLElement
     if (!element) {
