@@ -46,9 +46,21 @@ class PlannerCandidateError(RuntimeError):
     让异常携带原文后，写 jsonl、事后归因 prompt 问题都有据可查。
     """
 
-    def __init__(self, message: str, raw_response: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        raw_response: str = "",
+        finish_reason: Optional[str] = None,
+        completion_tokens: Optional[int] = None,
+    ) -> None:
         super().__init__(message)
         self.raw_response = raw_response
+        # 改造点：把 LLM 元信息一起带出来。
+        # 只有原文时仍然只能靠结构猜是不是截断；有了 finish_reason，
+        # "被 max_tokens 切断"和"模型正常收尾但 JSON 不合规"才能分开统计，
+        # 否则优化方向会一直错在改 prompt 上。
+        self.finish_reason = finish_reason
+        self.completion_tokens = completion_tokens
 
 
 PLANNER_MAX_ATTEMPTS = 5
@@ -472,6 +484,13 @@ class MultiAgentTripPlanner:
                 ),
             )
             self._log_timer(f"{label} 候选{index + 1} LLM调用", started_at)
+            # 取本线程最后一次调用的元信息：候选若走过工具循环，最终产出 JSON
+            # 的那次调用才是我们要归因的对象。TracedLLM 用 threading.local
+            # 存，所以 3 路并行不会互相覆盖。
+            meta = getattr(llm, "last_call", None)
+            # 把 token 用量落进指标：推理 token 挤占正文预算，是最隐蔽的
+            # "输出被切断"成因，光看 HTTP 200 完全发现不了。
+            metrics.record_llm_usage(meta)
             try:
                 trip_plan = self._parse_response(
                     response,
@@ -482,7 +501,12 @@ class MultiAgentTripPlanner:
             except Exception as error:
                 # 必须在这里包一层：response 是当前帧的局部变量，
                 # 一旦把异常抛回主线程，原始输出就再也拿不到了。
-                raise PlannerCandidateError(str(error), raw_response=response) from error
+                raise PlannerCandidateError(
+                    str(error),
+                    raw_response=response,
+                    finish_reason=getattr(meta, "finish_reason", None),
+                    completion_tokens=getattr(meta, "completion_tokens", None),
+                ) from error
             return index + 1, trip_plan
 
         valid: List[tuple[int, TripPlan]] = []
@@ -515,8 +539,13 @@ class MultiAgentTripPlanner:
                         response=getattr(error, "raw_response", "") or "",
                         error=root_error,
                         preference_reason="parallel_candidate_failed",
+                        finish_reason=getattr(error, "finish_reason", None),
+                        completion_tokens=getattr(error, "completion_tokens", None),
                     )
                     failures.append(failure)
+                    # 每失败一次就记一笔病因，/metrics 里能直接看到
+                    # "截断"和"schema 不合法"各占多少，不用再翻日志。
+                    metrics.record_planner_failure(failure.get("failure_kind", "unknown"))
                     try:
                         append_jsonl(PLANNER_FAILURE_LOG, failure)
                     except Exception:

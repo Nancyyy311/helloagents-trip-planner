@@ -4,9 +4,10 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..models.schemas import TripPlan, TripRequest
+from ..planner.failure_kind import classify_failure
 from ..services.mcp_env import PROJECT_ROOT
 
 
@@ -41,8 +42,24 @@ def build_failure_row(
     response: str,
     error: Exception,
     preference_reason: str = "planner_schema_invalid",
+    finish_reason: Optional[str] = None,
+    completion_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Build an online feedback row for invalid planner output."""
+    """Build an online feedback row for invalid planner output.
+
+    改造点（可归因）：原来这行只记 error 文本，而所有失败共享同一句
+    "响应中未找到完整的顶层TripPlan JSON对象"，导致"截断"和"schema 不合法"
+    无法区分，优化方向只能靠猜。现在额外落三样东西：
+
+    * `failure_kind`：结构化病因（见 planner/failure_kind.py）；
+    * `finish_reason`：API 给的权威信号，`length` 即代表被 max_tokens 截断；
+    * `raw_len` / `completion_tokens`：体积与用量，用来判断输出预算是否偏小。
+    """
+    kind = classify_failure(
+        response,
+        finish_reason,
+        json_parsed=preference_reason in {"preference_rerank", "schema_ok"},
+    )
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "label": label,
@@ -51,6 +68,10 @@ def build_failure_row(
         "request": request.model_dump(),
         "prompt": planner_query,
         "rejected": response,
+        "raw_len": len(response or ""),
+        "failure_kind": kind,
+        "finish_reason": finish_reason,
+        "completion_tokens": completion_tokens,
         "error_type": type(error).__name__,
         "error": str(error),
         "preference_reason": preference_reason,

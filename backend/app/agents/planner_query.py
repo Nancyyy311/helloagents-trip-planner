@@ -10,6 +10,25 @@ from ..models.schemas import TripPlan, TripRequest
 PLANNER_OUTPUT_BASE_TOKENS = int(os.getenv("PLANNER_OUTPUT_BASE_TOKENS", "3000"))
 PLANNER_OUTPUT_TOKENS_PER_DAY = int(os.getenv("PLANNER_OUTPUT_TOKENS_PER_DAY", "1800"))
 PLANNER_MAX_OUTPUT_TOKENS_CAP = int(os.getenv("PLANNER_MAX_OUTPUT_TOKENS_CAP", "16000"))
+# 模型单次生成的硬上限（DeepSeek V4 为 384K），防止配置写飞
+PLANNER_OUTPUT_HARD_CAP = 384000
+
+
+def _thinking_reserve() -> int:
+    """思考模式下为推理过程额外预留的 token。
+
+    为什么必须有这一步：DeepSeek V4 系列默认开启思考，思考 token 计入
+    `completion_tokens`，与正文共用 `max_tokens` 额度。3 天行程按正文估算
+    8400 token 是够的，但推理一旦先花掉五六千，正文必然半路被切断——
+    历史失败样本里 92% 的"JSON 不完整"就是这么来的。
+
+    所以“正文预算”和“推理预算”要分开算：正文仍按天数估算，
+    开启思考时再把推理预留加上，否则一开 thinking 就注定失败。
+    """
+    raw = os.getenv("PLANNER_THINKING", "0").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return int(os.getenv("PLANNER_REASONING_RESERVE", "8000"))
+    return 0
 
 
 def build_planner_query(planner_context_builder: Any, request: TripRequest, planner_context: Dict[str, Any]) -> str:
@@ -44,11 +63,16 @@ PlannerContext:
 
 
 def planner_max_output_tokens(request: TripRequest) -> int:
-    """按行程天数动态估算 Planner 输出上限。"""
-    return min(
+    """按行程天数动态估算 Planner 输出上限。
+
+    返回值是**整个 completion 的额度**（含推理 token），
+    因此开启思考模式时要在正文预算之外再加上推理预留。
+    """
+    text_budget = min(
         PLANNER_OUTPUT_BASE_TOKENS + request.travel_days * PLANNER_OUTPUT_TOKENS_PER_DAY,
         PLANNER_MAX_OUTPUT_TOKENS_CAP,
     )
+    return min(text_budget + _thinking_reserve(), PLANNER_OUTPUT_HARD_CAP)
 
 
 # 候选池里对"改行程"真正有用的字段。id/typecode/photo 之类对修改没有帮助，
