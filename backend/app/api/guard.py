@@ -58,6 +58,11 @@ class LimitConfig:
     # 其他接口：图片、POI 搜索、健康检查这类，只防刷不防正常使用
     default_per_minute: int = 120
     default_burst: int = 60
+    # 任务轮询：前端每 1.2 秒问一次进度，50 次/分钟只是"读一个内存字典"，
+    # 成本约等于零。它和真正花钱的 /plan 必须分档，否则前端一改轮询，
+    # 就会被自己的限流打死（实测：plan 档 6/分钟，第二次轮询就 429）。
+    poll_per_minute: int = 240
+    poll_burst: int = 120
     # 只有明确部署在反向代理后面时才信任 X-Forwarded-For。
     # 默认不信任：否则任何人换个请求头就能绕过按 IP 限流。
     trust_proxy: bool = False
@@ -69,6 +74,8 @@ CONFIG = LimitConfig(
     plan_burst=_env_int("RATE_LIMIT_PLAN_BURST", 3),
     default_per_minute=_env_int("RATE_LIMIT_DEFAULT_PER_MINUTE", 120),
     default_burst=_env_int("RATE_LIMIT_DEFAULT_BURST", 60),
+    poll_per_minute=_env_int("RATE_LIMIT_POLL_PER_MINUTE", 240),
+    poll_burst=_env_int("RATE_LIMIT_POLL_BURST", 120),
     trust_proxy=_env_flag("RATE_LIMIT_TRUST_PROXY", False),
 )
 
@@ -78,11 +85,15 @@ PLAN_PATHS = frozenset({
     "/api/trip/plan/async",
 })
 PLAN_PREFIX = "/api/trip/plan/"  # 含 /plan/{id}/refine
+# 任务读接口（轮询 / SSE / 取消）：不触发任何 LLM 调用，单独一档
+TASK_READ_PREFIX = "/api/trip/plan/async"
 
 # 探活与文档不参与限流：负载均衡健康检查被限流会直接摘掉节点。
 # 注意这里必须用后缀匹配：本项目真正的探活路径是 /api/trip/health，
 # 只写死 "/health" 会让上线后每 3 次探活就有 1 次 429，节点被误判为不可用。
-EXEMPT_PATH_SUFFIXES = ("/health",)
+# `/healthz` `/readyz` 是批次9 新加的分级探针，同样必须豁免——
+# 这两个是 15 秒一次的存活/就绪探测，被限流等于给自己制造故障。
+EXEMPT_PATH_SUFFIXES = ("/health", "/healthz", "/readyz")
 EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json"})
 
 
@@ -132,6 +143,8 @@ def _bucket_for(client_ip: str, tier: str, now: float) -> TokenBucket:
                 _prune_buckets_locked(now)
             if tier == "plan":
                 bucket = TokenBucket(CONFIG.plan_burst, CONFIG.plan_per_minute / 60.0)
+            elif tier == "poll":
+                bucket = TokenBucket(CONFIG.poll_burst, CONFIG.poll_per_minute / 60.0)
             else:
                 bucket = TokenBucket(CONFIG.default_burst, CONFIG.default_per_minute / 60.0)
             _buckets[key] = bucket
@@ -149,13 +162,31 @@ def _prune_buckets_locked(now: float) -> None:
         _buckets.pop(key, None)
 
 
-def classify(path: str) -> Optional[str]:
-    """返回该路径的限流档位；None 表示不计限流。"""
+def classify(path: str, method: str = "GET") -> Optional[str]:
+    """返回该路径的限流档位；None 表示不计限流。
+
+    改造点（批次9）：**按成本分档，而不是按路径前缀分档。**
+
+    原来只要是 `/api/trip/plan/` 开头就算规划档（6 次/分钟）。这在同步接口时代
+    没问题——那条路径下只有一个请求。加了任务模型之后，`GET /plan/async/{id}`
+    （轮询进度）、`DELETE /plan/async/{id}`（取消）全被算进了规划档，
+    而前端为了显示进度每 1.2 秒就要轮询一次：**每次生成第 2 次轮询就被 429**，
+    用户看到的是"请求过于频繁"而不是"正在生成"。实测复现见 README 4.9。
+
+    判断依据改成"这次请求会不会触发 LLM 调用"：
+    - POST /plan、POST /plan/async、POST /plan/{id}/refine -> plan（严格）
+    - GET /plan/async/{id}、GET /plan/async/{id}/stream、DELETE -> poll（宽松）
+    """
     if path in EXEMPT_PATHS:
         return None
     if path.endswith(EXEMPT_PATH_SUFFIXES):
         # /health、/api/trip/health、/api/map/health 都算探活
         return None
+    # 任务读接口：轮询 1.2s 一次、SSE 长连接、取消请求，都不产生 LLM 调用。
+    # 注意要多带一个 "/"：`/api/trip/plan/async` 本身是"提交任务"（POST），
+    # 属于最贵的那一档，只有它下面的 /{task_id} 才是纯读。
+    if method.upper() != "POST" and path.startswith(TASK_READ_PREFIX + "/"):
+        return "poll"
     if path in PLAN_PATHS or path.startswith(PLAN_PREFIX):
         return "plan"
     return "default"
@@ -189,7 +220,7 @@ class RateLimitMiddleware:
             return
 
         path = scope.get("path", "")
-        tier = classify(path)
+        tier = classify(path, scope.get("method", "GET"))
         if tier is None:
             await self.app(scope, receive, send)
             return
@@ -205,10 +236,13 @@ class RateLimitMiddleware:
             from .observability import metrics
 
             metrics.record_rate_limited(tier)
+            tier_label = {"plan": "规划", "poll": "进度查询", "default": "普通"}.get(
+                tier, tier
+            )
             body = json.dumps(
                 {
                     "success": False,
-                    "message": f"请求过于频繁（{tier} 档限流），请 {retry_after:.0f} 秒后重试",
+                    "message": f"请求过于频繁（{tier_label}档限流），请 {retry_after:.0f} 秒后重试",
                     "detail": {"tier": tier, "retry_after_seconds": round(retry_after, 1)},
                 },
                 ensure_ascii=False,
@@ -304,6 +338,10 @@ class SingleFlight:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._inflight: dict[str, Future] = {}
+        # 每个 key 上挂了多少个等待者。原实现只记 joined 总数，
+        # 没法回答"这个 key 现在还有人等吗"——而断连取消恰恰需要这个答案：
+        # 发起人走了但别人还在等，就不能把这份结果作废。
+        self._waiters: dict[str, int] = {}
         self.joined = 0
 
     def claim(self, key: str):
@@ -312,15 +350,23 @@ class SingleFlight:
             existing = self._inflight.get(key)
             if existing is not None:
                 self.joined += 1
+                self._waiters[key] = self._waiters.get(key, 0) + 1
                 return False, existing
             future: Future = Future()
             self._inflight[key] = future
+            self._waiters[key] = 0
             return True, future
+
+    def has_waiters(self, key: str) -> bool:
+        """这个 key 上是否还有别的请求在等结果。"""
+        with self._lock:
+            return self._waiters.get(key, 0) > 0
 
     def finish(self, key: str, future: Future, *, result=None, error: Optional[BaseException] = None) -> None:
         """把结果交给等待者，并让出 key。必须先出表再 set："""
         with self._lock:
             self._inflight.pop(key, None)
+            self._waiters.pop(key, None)
         if error is not None:
             future.set_exception(error)
         else:
@@ -333,6 +379,7 @@ class SingleFlight:
     def reset(self) -> None:
         with self._lock:
             self._inflight.clear()
+            self._waiters.clear()
             self.joined = 0
 
 

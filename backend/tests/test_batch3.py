@@ -193,7 +193,7 @@ def test_sse_stream_pushes_status_and_result(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
     )
     task_id = _submit_and_wait()
 

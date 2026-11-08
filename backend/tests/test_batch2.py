@@ -49,7 +49,7 @@ def test_sync_plan_success(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
     )
     r = client.post("/api/trip/plan", json=SAMPLE)
     assert r.status_code == 200, r.text
@@ -61,7 +61,7 @@ def test_sync_plan_fallback_returns_502(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "fallback_success", "Planner失败，已返回fallback计划"),
+        lambda req, cancel_token=None: (_fake_plan(), "fallback_success", "Planner失败，已返回fallback计划"),
     )
     r = client.post("/api/trip/plan", json=SAMPLE)
     assert r.status_code == 502, r.text
@@ -75,7 +75,7 @@ def test_async_task_flow(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "默认 Planner 生成成功"),
     )
     submit = client.post("/api/trip/plan/async", json=SAMPLE)
     assert submit.status_code == 200, submit.text

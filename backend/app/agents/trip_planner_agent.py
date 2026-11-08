@@ -18,6 +18,7 @@ from .planner_feedback import (
     is_non_retryable_llm_error,
     log_preference_candidates,
 )
+from ..planner.cancel import CancelToken, PlanCancelled
 from ..planner.context import PlannerContextBuilder
 from ..planner.grounding import verify_trip_plan
 from ..planner.output import (
@@ -91,6 +92,11 @@ PLANNER_TOOL_MAX_ITERATIONS = max(1, int(os.getenv("PLANNER_TOOL_MAX_ITERATIONS"
 PLANNER_LLM_MAX_RETRIES = max(0, int(os.getenv("PLANNER_LLM_MAX_RETRIES", "2")))
 PLANNER_LLM_RETRY_BASE_DELAY = float(os.getenv("PLANNER_LLM_RETRY_BASE_DELAY", "2.0"))
 
+# 等候选返回时的轮询粒度（秒）。它同时是"取消延迟"的上界：
+# 每 0.4 秒问一次要不要继续等，用户点了取消最多 0.4 秒就能把并发位让出来。
+# 再小会让空转变多，再大会让取消明显变迟钝。
+_PARALLEL_POLL_SECONDS = float(os.getenv("PLANNER_PARALLEL_POLL_SECONDS", "0.4"))
+
 # 命中这些关键字说明是"临时性故障/被限流"，值得重试
 _RETRYABLE_LLM_HINTS = (
     "429",
@@ -161,18 +167,48 @@ class MultiAgentTripPlanner:
             traceback.print_exc()
             raise
 
-    def plan_trip(self, request: TripRequest) -> TripPlan:
+    # === 改造点：可取消 ===
+    # 把取消令牌存成实例属性而不是往下透传十几层参数：这些方法本来就都是
+    # 同一个请求独占的实例方法（每次请求 new 一个 MultiAgentTripPlanner），
+    # 不存在跨请求串号的风险。
+    def _checkpoint(self, stage: str) -> None:
+        """在花钱的边界检查取消信号。没传令牌时是空操作，行为和改造前一致。"""
+        token = getattr(self, "_cancel_token", None)
+        if token is not None:
+            token.checkpoint(stage)
+
+    def _sleep_or_cancel(self, seconds: float, stage: str) -> None:
+        """睡了还能被打断；没有令牌时退回普通 sleep。"""
+        token = getattr(self, "_cancel_token", None)
+        if token is not None:
+            token.sleep(seconds, stage)
+        else:
+            time.sleep(seconds)
+
+    def plan_trip(
+        self,
+        request: TripRequest,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> TripPlan:
         """
         使用多智能体协作生成旅行计划
 
         Args:
             request: 旅行请求
+            cancel_token: 可选的取消令牌。客户端断开/用户主动删除任务时置位，
+                生成流程会在下一个检查点抛出 PlanCancelled 停下，不再提交新的
+                LLM 与高德调用。（正在飞的那一次调用无法中途掐断，见 cancel.py）
 
         Returns:
             旅行计划
+
+        Raises:
+            PlanCancelled: 生成过程中收到取消信号
         """
+        self._cancel_token = cancel_token
         total_started_at = time.perf_counter()
         try:
+            self._checkpoint("plan_start")
             print(f"\n{'='*60}")
             print("🚀 开始多智能体协作规划旅行...")
             print(f"目的地: {request.city}")
@@ -186,6 +222,8 @@ class MultiAgentTripPlanner:
             # 步骤1: 并行获取结构化工具快照
             print("📍 步骤1: 并行获取景点/天气/酒店工具快照...")
             step_started_at = time.perf_counter()
+            # 取快照要打好几次高德接口（有配额成本），取消要在这里先拦一次
+            self._checkpoint("before_context_collect")
             planner_context = self.planner_context_builder.collect(request)
             self._log_timer("步骤1 工具快照获取", step_started_at)
             self.planner_context_builder.print_summary(planner_context)
@@ -194,6 +232,7 @@ class MultiAgentTripPlanner:
             # 步骤2: 行程规划Agent整合信息生成计划
             print("📋 步骤2: 生成行程计划...")
             step_started_at = time.perf_counter()
+            self._checkpoint("before_build_query")
             planner_query = build_planner_query(self.planner_context_builder, request, planner_context)
             self._log_timer("步骤2 Planner输入构造", step_started_at)
             print(f"Planner输入长度: {len(planner_query)} 字符")
@@ -247,6 +286,10 @@ class MultiAgentTripPlanner:
                     max_call_failures=PLANNER_FALLBACK_CALL_FAILURE_LIMIT,
                 )
                 log_preference_candidates(planner_query, request, trip_plan, parse_error.failures)
+            except PlanCancelled:
+                # 取消不是"这次调用失败"，不能走"换个模型再试一遍"的回退链：
+                # 那等于用户已经关页面了，我们还额外多烧一次 fallback 调用。
+                raise
             except Exception as planner_error:
                 if self.planner_llm is self.tool_llm:
                     raise
@@ -284,6 +327,16 @@ class MultiAgentTripPlanner:
 
             return trip_plan
 
+        except PlanCancelled:
+            # 必须显式放行。下面那个 except Exception 会把**任何**异常翻译成
+            # "fallback 模板计划 + 200 成功"，取消一旦被它吞掉，前端会以为
+            # 生成成功、拿到一份假计划，而用户其实早就关页面了。
+            # 这是本批改造里最容易漏、也最容易被追问的一处。
+            self.last_generation_status = "cancelled"
+            self.last_generation_message = "生成已取消"
+            print("⏹️  生成已取消，不再回退 fallback 计划", flush=True)
+            self._log_timer("旅行计划总耗时(取消)", total_started_at)
+            raise
         except Exception as e:
             print(f"❌ 生成旅行计划失败: {str(e)}")
             import traceback
@@ -304,6 +357,7 @@ class MultiAgentTripPlanner:
         request: TripRequest,
         previous_plan: TripPlan,
         instruction: str,
+        cancel_token: Optional[CancelToken] = None,
     ) -> TripPlan:
         """在已有计划上做增量修改（多轮会话）。
 
@@ -329,11 +383,13 @@ class MultiAgentTripPlanner:
             PlannerGenerationError: 模型输出无法解析为合法 TripPlan
         """
         total_started_at = time.perf_counter()
+        self._cancel_token = cancel_token
         print(f"\n{'='*60}")
         print("✏️  开始增量修改行程...")
         print(f"修改要求: {instruction}")
         print(f"{'='*60}\n")
 
+        self._checkpoint("refine_start")
         step_started_at = time.perf_counter()
         planner_context = self.planner_context_builder.collect(request)
         self._log_timer("增量修改 上下文获取(可命中缓存)", step_started_at)
@@ -400,10 +456,16 @@ class MultiAgentTripPlanner:
         call 是一个无参可调用对象（闭包），这样并行候选和串行兜底两条路径都能复用。
         """
         for attempt in range(PLANNER_LLM_MAX_RETRIES + 1):
+            # 每次重试前都是一个"即将花钱"的边界：已取消就别再发了
+            self._checkpoint(f"before_llm:{label}")
             try:
                 result = call()
                 metrics.record_llm(True)
                 return result
+            except PlanCancelled:
+                # 候选内部抛出的取消信号，不能算作一次 LLM 失败（会污染成功率指标），
+                # 也不能进入下面的"可重试"判断
+                raise
             except Exception as error:
                 retryable = self._is_retryable_llm_error(error)
                 if attempt >= PLANNER_LLM_MAX_RETRIES or not retryable:
@@ -416,7 +478,9 @@ class MultiAgentTripPlanner:
                     f"-> {delay:.1f}s 后重试 {attempt + 1}/{PLANNER_LLM_MAX_RETRIES}",
                     flush=True,
                 )
-                time.sleep(delay)
+                # 改造点：原来这里 time.sleep 睡死。取消时也要把 5s/8s 的退避睡完
+                # 才能轮到下一个检查点，等于"喊停了还多等十几秒"。改成可打断的等待。
+                self._sleep_or_cancel(delay, f"backoff:{label}")
         raise RuntimeError(f"{label} LLM调用重试耗尽")
 
     def _run_agent_stateless(self, agent: SimpleAgent, input_text: str, **kwargs) -> str:
@@ -446,7 +510,7 @@ class MultiAgentTripPlanner:
         _history，互不干扰），共享线程安全的 LLM 客户端（OpenAI SDK 客户端线程安全）。
         返回 (有效候选[(attempt, TripPlan)], 失败记录列表)。
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         llm = agent.llm
         max_output_tokens = planner_max_output_tokens(request)
@@ -464,6 +528,9 @@ class MultiAgentTripPlanner:
         ]
 
         def _one(index: int, temperature: float) -> tuple[int, TripPlan]:
+            # 每个候选是一次独立计费的 LLM 调用。候选是并发提交的，
+            # 取消发生在提交之后很常见，所以这里必须再检查一次。
+            self._checkpoint(f"candidate_{index + 1}_start")
             candidate_agent = SimpleAgent(
                 name=f"{label}-候选{index + 1}",
                 llm=llm,
@@ -511,45 +578,72 @@ class MultiAgentTripPlanner:
 
         valid: List[tuple[int, TripPlan]] = []
         failures: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=target_candidate_count) as executor:
-            future_map = {
-                executor.submit(_one, index, temperatures[index]): index + 1
-                for index in range(target_candidate_count)
-            }
-            for future in as_completed(future_map):
-                attempt_index = future_map[future]
-                try:
-                    valid.append(future.result())
-                except Exception as error:
-                    # 包装异常的 error_type 会丢失"到底是 JSON 没找到还是 schema 不合法"，
-                    # 归因时只认根因，所以往下取 __cause__。
-                    root_error = getattr(error, "__cause__", None) or error
-                    print(
-                        f"⚠️  {label} 候选{attempt_index} 生成/解析失败: {root_error}",
-                        flush=True,
-                    )
-                    failure = build_failure_row(
-                        label=label,
-                        attempt=attempt_index,
-                        max_attempts=target_candidate_count,
-                        request=request,
-                        planner_query=planner_query,
-                        # 改造点：原来这里写死 ""，导致并行路径的失败样本全丢原文；
-                        # 现在从异常里取回模型真实输出，失败样本才能用于归因/训练。
-                        response=getattr(error, "raw_response", "") or "",
-                        error=root_error,
-                        preference_reason="parallel_candidate_failed",
-                        finish_reason=getattr(error, "finish_reason", None),
-                        completion_tokens=getattr(error, "completion_tokens", None),
-                    )
-                    failures.append(failure)
-                    # 每失败一次就记一笔病因，/metrics 里能直接看到
-                    # "截断"和"schema 不合法"各占多少，不用再翻日志。
-                    metrics.record_planner_failure(failure.get("failure_kind", "unknown"))
+        # 已取消就一个候选都不提交：这是"取消"最省钱的位置
+        self._checkpoint("before_parallel_candidates")
+        # === 改造点：取消时不再等候选跑完 ===
+        # 原来用 `with ThreadPoolExecutor(...)`：退出时会 shutdown(wait=True)，
+        # 把还挂在 LLM 上的候选**全部等完**才继续。取消一个正在跑的任务，
+        # 实测要 17 秒后才变成 canceled（等最慢的候选返回），而且这段时间
+        # 并发闸门一直被占着 —— 用户想换个城市重来，撞到的却是 503。
+        # 现在改成手动管理：等待用 wait(timeout)，每 0.4 秒问一次"还要不要等"，
+        # 一旦取消就立刻返回，把并发位让出来（在飞的那次调用确实拦不住，
+        # 但不会再拖住整个服务的并发额度）。
+        executor = ThreadPoolExecutor(max_workers=target_candidate_count)
+        future_map = {
+            executor.submit(_one, index, temperatures[index]): index + 1
+            for index in range(target_candidate_count)
+        }
+        pending = set(future_map)
+        try:
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=_PARALLEL_POLL_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                self._checkpoint("parallel_wait")
+                for future in done:
+                    attempt_index = future_map[future]
                     try:
-                        append_jsonl(PLANNER_FAILURE_LOG, failure)
-                    except Exception:
-                        pass
+                        valid.append(future.result())
+                    except PlanCancelled:
+                        # 候选被取消不是"这个候选失败了"，不该写进失败样本
+                        # （否则离线归因会把取消误判成模型问题）。
+                        raise
+                    except Exception as error:
+                        # 包装异常的 error_type 会丢失"到底是 JSON 没找到还是 schema 不合法"，
+                        # 归因时只认根因，所以往下取 __cause__。
+                        root_error = getattr(error, "__cause__", None) or error
+                        print(
+                            f"⚠️  {label} 候选{attempt_index} 生成/解析失败: {root_error}",
+                            flush=True,
+                        )
+                        failure = build_failure_row(
+                            label=label,
+                            attempt=attempt_index,
+                            max_attempts=target_candidate_count,
+                            request=request,
+                            planner_query=planner_query,
+                            # 改造点：原来这里写死 ""，导致并行路径的失败样本全丢原文；
+                            # 现在从异常里取回模型真实输出，失败样本才能用于归因/训练。
+                            response=getattr(error, "raw_response", "") or "",
+                            error=root_error,
+                            preference_reason="parallel_candidate_failed",
+                            finish_reason=getattr(error, "finish_reason", None),
+                            completion_tokens=getattr(error, "completion_tokens", None),
+                        )
+                        failures.append(failure)
+                        # 每失败一次就记一笔病因，/metrics 里能直接看到
+                        # "截断"和"schema 不合法"各占多少，不用再翻日志。
+                        metrics.record_planner_failure(failure.get("failure_kind", "unknown"))
+                        try:
+                            append_jsonl(PLANNER_FAILURE_LOG, failure)
+                        except Exception:
+                            pass
+        finally:
+            # wait=False：取消路径上不要为了"等线程收尾"再把延迟拉长十几秒。
+            # 排队中的候选直接取消掉（它们还没开始花钱）。
+            executor.shutdown(wait=False, cancel_futures=True)
 
         valid.sort(key=lambda item: item[0])
         # 改造点：候选池不足要变成指标。原项目只打一行日志，接口照样返回成功，
@@ -616,6 +710,11 @@ class MultiAgentTripPlanner:
                     f"⚡ {label} 并行候选完成: 有效 {len(valid_candidates)}/{target_candidate_count}",
                     flush=True,
                 )
+            except PlanCancelled:
+                # 关键放行：这里原本会"并行出错→回退串行重试"，
+                # 取消一旦落进这条分支，就变成"取消了还要再串行跑 3 次"，
+                # 比不取消更费钱。
+                raise
             except Exception as parallel_error:
                 print(
                     f"⚠️  {label} 并行候选出错，回退串行重试: {parallel_error}",
@@ -624,6 +723,7 @@ class MultiAgentTripPlanner:
 
         # 并行已拿到候选时 range 为空 -> 跳过串行循环；否则走原串行重试兜底。
         for attempt in (range(1, max_attempts + 1) if not valid_candidates else []):
+            self._checkpoint(f"serial_attempt_{attempt}")
             print(f"{label} 第 {attempt}/{max_attempts} 次生成...", flush=True)
             call_started_at = time.perf_counter()
             max_output_tokens = planner_max_output_tokens(request)
@@ -649,6 +749,8 @@ class MultiAgentTripPlanner:
                         max_tool_iterations=PLANNER_TOOL_MAX_ITERATIONS,
                     ),
                 )
+            except PlanCancelled:
+                raise
             except Exception as error:
                 call_failures += 1
                 self._log_timer(f"{label} 第 {attempt} 次LLM调用失败耗时", call_started_at)
@@ -709,6 +811,8 @@ class MultiAgentTripPlanner:
                 )
                 if len(valid_candidates) >= target_candidate_count:
                     break
+            except PlanCancelled:
+                raise
             except Exception as error:
                 self._log_timer(f"{label} 第 {attempt} 次解析校验失败耗时", parse_started_at)
                 last_error = error

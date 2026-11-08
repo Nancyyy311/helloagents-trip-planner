@@ -3,11 +3,12 @@
 import asyncio
 import hashlib
 import json
+import os
 import threading
 import time
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...models.schemas import (
@@ -23,6 +24,7 @@ from ...agents.trip_planner_agent import (
     MultiAgentTripPlanner,
     get_trip_planner_agent,
 )
+from ...planner.cancel import CancelToken, PlanCancelled
 from ..guard import PlanningBusy, plan_gate, single_flight
 from ..observability import metrics
 
@@ -32,19 +34,26 @@ router = APIRouter(prefix="/trip", tags=["旅行规划"])
 # === 改造点：请求隔离 ===
 # 每个生成请求/任务都用一个独立的 planner 实例，避免共享单例上的
 # last_generation_status / _history 在并发时互相覆盖（串台）。
-def _plan_trip_isolated(request: TripRequest):
+def _plan_trip_isolated(request: TripRequest, cancel_token: CancelToken | None = None):
     """在独立实例上生成计划，返回 (trip_plan, status, message)。"""
     planner = MultiAgentTripPlanner()
-    trip_plan = planner.plan_trip(request)
+    trip_plan = planner.plan_trip(request, cancel_token=cancel_token)
     status = getattr(planner, "last_generation_status", "unknown")
     message = getattr(planner, "last_generation_message", "") or "旅行计划生成完成"
     return trip_plan, status, message
 
 
-def _refine_isolated(request: TripRequest, previous_plan: TripPlan, instruction: str):
+def _refine_isolated(
+    request: TripRequest,
+    previous_plan: TripPlan,
+    instruction: str,
+    cancel_token: CancelToken | None = None,
+):
     """在独立实例上做增量修改，返回 (trip_plan, status, message)。"""
     planner = MultiAgentTripPlanner()
-    trip_plan = planner.refine_trip(request, previous_plan, instruction)
+    trip_plan = planner.refine_trip(
+        request, previous_plan, instruction, cancel_token=cancel_token
+    )
     status = getattr(planner, "last_generation_status", "unknown")
     message = getattr(planner, "last_generation_message", "") or "增量修改完成"
     return trip_plan, status, message
@@ -88,17 +97,44 @@ _TASK_TTL_SECONDS = 3600
 # 只有 TTL 的话，一小时内提交多少就堆多少，进程内存只涨不落。
 _TASK_MAXSIZE = 200
 
+# === 改造点：孤儿任务回收 ===
+# 提交了任务、页面上却从此没有人再来问一次（既不轮询也不订阅 SSE），
+# 说明用户已经走了。这种任务原项目会一路跑到底：3 次候选 LLM + 一串高德调用，
+# 结果写进一张再也没人读的表。宽限 90 秒再动手，是因为：
+#   - 前端轮询间隔 1.5s，正常情况一秒内就会 touch 一次；
+#   - 浏览器把后台标签页的 setInterval 节流到约 1 分钟一次，
+#     90s > 60s，切到别的 tab 不会被误杀；
+#   - 设成 0 或负数即关闭回收（保守部署/调试时用）。
+_TASK_ORPHAN_GRACE_SECONDS = float(os.getenv("TASK_ORPHAN_GRACE_SECONDS", "90") or 90)
+# 后台清扫间隔：TTL 清理 + 孤儿回收共用同一个循环
+_TASK_JANITOR_INTERVAL = float(os.getenv("TASK_JANITOR_INTERVAL_SECONDS", "5") or 5)
+
 # SSE 推送参数：1 秒检查一次状态，15 秒发一次心跳，最多等 10 分钟
 _SSE_POLL_INTERVAL = 1.0
 _SSE_HEARTBEAT_SECONDS = 15.0
 _SSE_MAX_SECONDS = 600.0
+
+# 任务字典里不能出现在响应里的字段：
+# cancel 是跨线程的 Event 对象，既不可 JSON 序列化，也不该暴露给前端。
+_TASK_INTERNAL_FIELDS = ("cancel",)
+# 任务终态：到这些状态后就不再接受取消，也允许被 TTL/容量淘汰
+_TASK_TERMINAL = ("done", "failed", "canceled")
 
 
 def _get_task_snapshot(task_id: str) -> dict | None:
     """持锁拷贝一份任务快照，避免返回过程中被后台线程改动。"""
     with _tasks_lock:
         task = _tasks.get(task_id)
-        return dict(task) if task is not None else None
+        if task is None:
+            return None
+        return {k: v for k, v in task.items() if k not in _TASK_INTERNAL_FIELDS}
+
+
+def _get_task_token(task_id: str) -> CancelToken | None:
+    """取出任务的取消令牌（只有取消接口和后台线程需要它）。"""
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        return task.get("cancel") if task is not None else None
 
 
 def _sse_frame(payload: dict, event: str | None = None) -> str:
@@ -114,30 +150,37 @@ def _prune_tasks_locked() -> None:
     1. 过期就删（TTL）；
     2. **正在跑的任务不能删**。删了用户就查不到结果，可钱已经花掉了。
     容量淘汰同样跳过 pending/running，只淘汰已经结束的。
+
+    改造点：这里原来只判断"不是 pending/running"，新增的 `canceling`
+    （已喊停、等线程在下一个检查点退出）会落进"可以删"的一侧——
+    用户刚点了取消、再查一次却 404，会被当成"任务消失了"。改为白名单终态。
     """
     now = time.time()
     expired = [
         task_id
         for task_id, task in _tasks.items()
         if now - task.get("created_at", now) > _TASK_TTL_SECONDS
-        and task.get("status") not in ("pending", "running")
+        and task.get("status") in _TASK_TERMINAL
     ]
     for task_id in expired:
         _tasks.pop(task_id, None)
+        metrics.record_task_reaped()
 
     # 容量兜底：按创建顺序淘汰最旧的已完成任务
     if len(_tasks) >= _TASK_MAXSIZE:
         finished = [
             task_id
             for task_id, task in _tasks.items()
-            if task.get("status") in ("done", "failed")
+            if task.get("status") in _TASK_TERMINAL
         ]
         for task_id in finished[: max(0, len(_tasks) - _TASK_MAXSIZE + 1)]:
             _tasks.pop(task_id, None)
+            metrics.record_task_reaped()
 
 
 def _new_task() -> str:
     task_id = uuid.uuid4().hex
+    now = time.time()
     with _tasks_lock:
         _prune_tasks_locked()
         _tasks[task_id] = {
@@ -146,9 +189,133 @@ def _new_task() -> str:
             "message": "",
             "result": None,
             "error": None,
-            "created_at": time.time(),
+            "created_at": now,
+            "started_at": None,
+            "finished_at": None,
+            # 取消相关（cancel 是对象，响应里会被剔除，只暴露下面两个可读字段）
+            "cancel": CancelToken(),
+            "cancel_reason": "",
+            "cancel_stage": "",
+            # 谁还在看这个任务：轮询/SSE 都会刷新 last_seen
+            "last_seen": now,
+            "watched": False,
+            "sse_subscribers": 0,
         }
     return task_id
+
+
+def _touch_task(task_id: str) -> dict | None:
+    """标记"还有人在看这个任务"，返回最新快照。
+
+    没有这个心跳，服务端无法区分"用户还在等"和"用户早就走了"——
+    孤儿回收就是靠它判断的，所以轮询接口必须调用它。
+    """
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return None
+        task["last_seen"] = time.time()
+        task["watched"] = True
+        return {k: v for k, v in task.items() if k not in _TASK_INTERNAL_FIELDS}
+
+
+def _subscribe_task(task_id: str) -> bool:
+    """SSE 订阅数 +1；任务不存在返回 False。"""
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return False
+        task["sse_subscribers"] = int(task.get("sse_subscribers", 0)) + 1
+        task["last_seen"] = time.time()
+        task["watched"] = True
+        return True
+
+
+def _unsubscribe_task(task_id: str) -> None:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is not None:
+            task["sse_subscribers"] = max(0, int(task.get("sse_subscribers", 0)) - 1)
+
+
+def cancel_task(task_id: str, reason: str = "client_deleted") -> tuple[str, dict | None]:
+    """请求取消一个任务，返回 (结果, 快照)。
+
+    结果的四种取值，对应接口层要给出的四种响应：
+
+    - `missing`：任务不存在或已过期 -> 404
+    - `finished`：已经跑完（done/failed/canceled），取消没有意义 -> 409，
+      这是幂等语义下的正确做法：不假装成功，让调用方知道结果已经在里面了
+    - `canceling`：任务在跑，已置取消信号，等线程在下一个检查点退出
+    - `canceled`：任务还没开始（pending），直接改终态，后台线程会看到信号后空转返回
+
+    为什么不用 202：调用方真正想知道的是"还会不会继续花钱"。
+    对 pending 我们能立刻保证不会，对 running 只能保证"下一次花钱前停下"，
+    所以用两个不同状态把这件事如实说清楚，而不是统一回一个模糊的"已受理"。
+    """
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return "missing", None
+        status = task.get("status")
+        if status in _TASK_TERMINAL:
+            return "finished", {k: v for k, v in task.items() if k not in _TASK_INTERNAL_FIELDS}
+
+        token: CancelToken = task["cancel"]
+        token.cancel(reason)
+        task["cancel_reason"] = reason
+        if status == "pending":
+            task["status"] = "canceled"
+            task["success"] = False
+            task["message"] = "任务在开始前被取消"
+            task["finished_at"] = time.time()
+            result = "canceled"
+        else:
+            # 已经在跑：不能杀线程，只能等它在下一个检查点自己退出
+            task["status"] = "canceling"
+            task["message"] = "已请求取消，等待当前步骤结束"
+            result = "canceling"
+        snapshot = {k: v for k, v in task.items() if k not in _TASK_INTERNAL_FIELDS}
+
+    # 指标在锁外记，避免持锁调用另一个带锁的组件
+    if result == "canceled":
+        metrics.record_task_canceled(reason, "before_start")
+    return result, snapshot
+
+
+def sweep_task_store() -> dict:
+    """后台清扫一轮：过期清理 + 孤儿回收。由 main.py 的 janitor 协程定时调用。
+
+    修掉一个原实现里的真实漏洞：`_prune_tasks_locked()` 只在**提交新任务**时
+    被顺手调用。也就是说，用户提交过一个任务之后再也没人来过，这个任务会一直
+    留在内存里直到进程重启——TTL 写了但没有任何人触发它。
+    """
+    reaped = 0
+    abandoned = 0
+    now = time.time()
+
+    with _tasks_lock:
+        before = len(_tasks)
+        _prune_tasks_locked()
+        reaped += before - len(_tasks)
+
+    if _TASK_ORPHAN_GRACE_SECONDS > 0:
+        candidates: list[str] = []
+        with _tasks_lock:
+            for task_id, task in _tasks.items():
+                if task.get("status") not in ("pending", "running"):
+                    continue
+                if int(task.get("sse_subscribers", 0)) > 0:
+                    continue
+                if now - task.get("last_seen", now) > _TASK_ORPHAN_GRACE_SECONDS:
+                    candidates.append(task_id)
+        for task_id in candidates:
+            result, _ = cancel_task(task_id, "orphan_reclaimed")
+            if result in ("canceling", "canceled"):
+                abandoned += 1
+                metrics.record_task_abandoned()
+
+    return {"reaped": reaped, "abandoned": abandoned}
 
 
 def _update_task(task_id: str, **fields) -> None:
@@ -163,6 +330,23 @@ def _run_plan_task(task_id: str, request: TripRequest) -> None:
     后台任务跑在 worker 线程里，和事件循环里的同步接口共用同一个闸门，
     否则异步接口就成了绕过并发的后门（挂着几十个 task 一样能压垮进程）。
     """
+    token = _get_task_token(task_id)
+    if token is None:
+        # 任务已被清掉（TTL/容量淘汰），没有任何人需要这个结果
+        return
+    # 提交后立刻被取消（用户连点两下"取消"、或者前端根本没等）：
+    # 连闸门都不该占，直接结束。
+    if token.cancelled:
+        _update_task(
+            task_id,
+            status="canceled",
+            success=False,
+            message="任务在开始前被取消",
+            cancel_reason=token.reason,
+            finished_at=time.time(),
+        )
+        return
+
     if not plan_gate.try_enter():
         metrics.record_planning_rejected()
         _update_task(
@@ -170,23 +354,49 @@ def _run_plan_task(task_id: str, request: TripRequest) -> None:
             status="failed",
             success=False,
             error=f"当前规划任务已达上限（{plan_gate.limit} 个），请稍后重试",
+            finished_at=time.time(),
         )
         return
-    _update_task(task_id, status="running")
+    _update_task(task_id, status="running", started_at=time.time())
     try:
-        trip_plan, status, message = _plan_trip_isolated(request)
+        trip_plan, status, message = _plan_trip_isolated(request, cancel_token=token)
+        # 任务可能在最后一步被取消，此时不该把"成功"写回去
+        token.checkpoint("before_write_result")
         _update_task(
             task_id,
             status="done",
             success=(status == "llm_success"),
             message=message,
             result=trip_plan.model_dump(mode="json"),
+            finished_at=time.time(),
             # 异步任务也返回 plan_id，前端拿到结果后同样可以继续增量修改
             plan_id=_remember_plan(trip_plan, request),
         )
+    except PlanCancelled as exc:
+        # 取消不是失败：不写 error（前端看到 error 会弹红框），只写"已取消"，
+        # 并把停在哪个阶段记下来——这个字段决定了"省下了多少钱"。
+        metrics.record_task_canceled(exc.reason, exc.stage)
+        _update_task(
+            task_id,
+            status="canceled",
+            success=False,
+            message="任务已取消",
+            error=None,
+            cancel_reason=exc.reason,
+            cancel_stage=exc.stage,
+            finished_at=time.time(),
+        )
+        print(
+            f"⏹️  任务 {task_id[:8]} 已取消: stage={exc.stage} reason={exc.reason} "
+            f"（喊停后 {token.elapsed_since_cancel():.1f}s 才停下）",
+            flush=True,
+        )
     except Exception as e:
-        _update_task(task_id, status="failed", success=False, error=str(e))
+        _update_task(
+            task_id, status="failed", success=False, error=str(e), finished_at=time.time()
+        )
     finally:
+        # 无论成功、失败还是取消，闸门都必须放掉，否则取消几次就把并发位漏光了
         plan_gate.leave()
 
 
@@ -328,12 +538,12 @@ def diff_plans(before: TripPlan, after: TripPlan) -> PlanDiff:
     summary="生成旅行计划",
     description="根据用户输入的旅行需求,生成详细的旅行计划"
 )
-async def plan_trip(request: TripRequest):
+async def plan_trip(payload: TripRequest):
     """
     生成旅行计划（同步接口）
 
     Args:
-        request: 旅行请求参数
+        payload: 旅行请求参数
 
     Returns:
         旅行计划响应
@@ -341,9 +551,9 @@ async def plan_trip(request: TripRequest):
     try:
         print(f"\n{'='*60}")
         print("📥 收到旅行规划请求:")
-        print(f"   城市: {request.city}")
-        print(f"   日期: {request.start_date} - {request.end_date}")
-        print(f"   天数: {request.travel_days}")
+        print(f"   城市: {payload.city}")
+        print(f"   日期: {payload.start_date} - {payload.end_date}")
+        print(f"   天数: {payload.travel_days}")
         print(f"{'='*60}\n")
 
         # === 改造点：不阻塞事件循环 ===
@@ -353,7 +563,7 @@ async def plan_trip(request: TripRequest):
         # === 改造点：相同请求合并（single flight）===
         # 用户连点两次"生成"、或前端超时重试，会发出两个一模一样的请求。
         # 不合并就是两份 3 候选的账单，而且结果几乎一样。
-        coalesce_key = _plan_request_key(request)
+        coalesce_key = _plan_request_key(payload)
         is_leader, future = single_flight.claim(coalesce_key)
         coalesced = not is_leader
 
@@ -385,9 +595,17 @@ async def plan_trip(request: TripRequest):
                     headers={"Retry-After": "5"},
                 )
             print("🚀 开始生成旅行计划（线程池执行）...")
+            # 关于"客户端断开就取消"：这里**刻意没有**做断连探测。
+            # 实测结论（见 README_改造说明.md 4.8）：在 FastAPI + BaseHTTPMiddleware
+            # 这套栈上，`request.is_disconnected()` 在请求体已经被读取之后恒返回
+            # False（请求体未读时有效），放在独立 task 里调用同样无效；
+            # 退而求其次用 StreamingResponse 定时写 keepalive，少量数据会被内核
+            # 缓冲区吃掉，同样观察不到断开。
+            # 所以同步接口这条路上，可靠的取消来源只有一个：客户端自己说不要了。
+            # 前端因此改用 /plan/async + 轮询，并在页面卸载时发 DELETE。
             try:
                 trip_plan, generation_status, generation_message = await asyncio.to_thread(
-                    _plan_trip_isolated, request
+                    _plan_trip_isolated, payload
                 )
             except Exception as e:
                 # 先把失败抛给等待者，再往上冒泡
@@ -414,7 +632,7 @@ async def plan_trip(request: TripRequest):
                     success=False,
                     message=generation_message,
                     data=trip_plan,
-                    plan_id=_remember_plan(trip_plan, request),
+                    plan_id=_remember_plan(trip_plan, payload),
                     coalesced=coalesced,
                 ).model_dump(mode="json"),
             )
@@ -425,7 +643,7 @@ async def plan_trip(request: TripRequest):
             success=True,
             message=generation_message,
             data=trip_plan,
-            plan_id=_remember_plan(trip_plan, request),
+            plan_id=_remember_plan(trip_plan, payload),
             coalesced=coalesced,
         )
 
@@ -491,7 +709,9 @@ async def refine_plan(plan_id: str, payload: RefineRequest):
         )
 
     try:
-        # 同样用 to_thread：修改也是几十秒的同步阻塞调用
+        # 同样用 to_thread：修改也是几十秒的同步阻塞调用。
+        # 和 /plan 一样不做断连探测（原因见 /plan 的注释），
+        # 但 _refine_isolated 已经支持 cancel_token，接上异步任务模型即可复用。
         new_plan, _status, message = await asyncio.to_thread(
             _refine_isolated, request, previous_plan, payload.instruction
         )
@@ -546,11 +766,41 @@ async def plan_trip_async(request: TripRequest, background_tasks: BackgroundTask
     description="返回任务状态（pending/running/done/failed）与结果"
 )
 async def get_plan_task(task_id: str):
-    """查询异步任务状态与结果（轮询方式）。"""
-    snapshot = _get_task_snapshot(task_id)
+    """查询异步任务状态与结果（轮询方式）。
+
+    用 `_touch_task` 而不是只读快照：这个调用同时是"我还在这儿等着"的心跳。
+    少了它，一个老老实实轮询的前端也会被孤儿回收当成"没人要了"。
+    """
+    snapshot = _touch_task(task_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     return {"task_id": task_id, **snapshot}
+
+
+@router.delete(
+    "/plan/async/{task_id}",
+    summary="取消异步任务",
+    description=(
+        "取消一个还没跑完的生成任务。pending 立刻变为 canceled；"
+        "running 会置取消信号，在下一个检查点停下并变为 canceled。"
+    ),
+)
+async def cancel_plan_task(task_id: str, reason: str = "client_deleted"):
+    """取消任务，停止继续消耗 LLM 与高德配额。
+
+    原项目没有这个能力：任务一旦提交就跑到头。用户关掉页面、换成别的城市、
+    连点两次生成，前一个任务照样把 3 个候选跑完，钱照扣。
+    """
+    result, snapshot = cancel_task(task_id, reason)
+    if result == "missing":
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if result == "finished":
+        # 409 而不是 200：调用方需要知道"结果已经在那儿了，别再等了"
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务已结束（{snapshot.get('status') if snapshot else 'unknown'}），无需取消",
+        )
+    return {"task_id": task_id, "cancel": result, **snapshot}
 
 
 @router.get(
@@ -563,6 +813,16 @@ async def stream_plan_task(task_id: str):
 
     改造点（相对轮询）：轮询是"前端定时问"，空转请求多、结果最多晚一个间隔才看到；
     SSE 是"服务端状态一变就推"，一次连接拿到底，还能顺带发心跳保活。
+
+    改造点（本批）：订阅计数 + 断连可观测。
+    原实现是个 `while True`，完全不看客户端还在不在：浏览器关页面后连接被动消失，
+    日志上没有任何痕迹，而任务还在后台跑着 3 个候选。
+
+    注意：这里**不用** `request.is_disconnected()`。实测在请求体已被读取的场景下
+    它恒返回 False（详见 README_改造说明.md 4.8），靠它判断断连是自欺欺人。
+    可靠的做法是让 Starlette 自己收尾：客户端断开时它会取消这个生成器，
+    finally 一定执行；在 finally 里看任务有没有跑到终态，就能准确判断
+    "这次连接是正常收完的还是中途断的"。
     """
     if _get_task_snapshot(task_id) is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
@@ -571,35 +831,50 @@ async def stream_plan_task(task_id: str):
         last_status = None
         started_at = time.time()
         last_heartbeat = time.time()
-        while True:
+        _subscribe_task(task_id)
+        metrics.record_sse_connect()
+        try:
+            while True:
+                snapshot = _get_task_snapshot(task_id)
+                if snapshot is None:
+                    yield _sse_frame({"task_id": task_id, "message": "任务已过期"}, "error")
+                    return
+
+                status = snapshot.get("status")
+                if status != last_status:
+                    last_status = status
+                    # 状态一变就推一帧，前端可以据此切换"排队中/生成中/取消中"
+                    yield _sse_frame({"task_id": task_id, "status": status}, "status")
+
+                if status in _TASK_TERMINAL:
+                    yield _sse_frame({"task_id": task_id, **snapshot}, "result")
+                    return
+
+                if time.time() - started_at > _SSE_MAX_SECONDS:
+                    yield _sse_frame(
+                        {"task_id": task_id, "message": "等待超时，请改用轮询接口"},
+                        "timeout",
+                    )
+                    return
+
+                await asyncio.sleep(_SSE_POLL_INTERVAL)
+
+                # 心跳：长时间没有状态变化时，避免网关/浏览器把空闲连接掐断
+                if time.time() - last_heartbeat >= _SSE_HEARTBEAT_SECONDS:
+                    yield ": ping\n\n"
+                    last_heartbeat = time.time()
+        finally:
+            _unsubscribe_task(task_id)
             snapshot = _get_task_snapshot(task_id)
-            if snapshot is None:
-                yield _sse_frame({"task_id": task_id, "message": "任务已过期"}, "error")
-                return
-
-            status = snapshot.get("status")
-            if status != last_status:
-                last_status = status
-                # 状态一变就推一帧，前端可以据此切换"排队中/生成中"
-                yield _sse_frame({"task_id": task_id, "status": status}, "status")
-
-            if status in ("done", "failed"):
-                yield _sse_frame({"task_id": task_id, **snapshot}, "result")
-                return
-
-            if time.time() - started_at > _SSE_MAX_SECONDS:
-                yield _sse_frame(
-                    {"task_id": task_id, "message": "等待超时，请改用轮询接口"},
-                    "timeout",
+            if snapshot is not None and snapshot.get("status") not in _TASK_TERMINAL:
+                # 任务还没跑到终态，连接就没了 —— 用户关了页面或者切走了。
+                # 这时候任务还在后台烧钱，必须能看见。
+                metrics.record_sse_disconnect()
+                print(
+                    f"🔌 SSE 断开 task={task_id[:8]} "
+                    f"（连接维持 {time.time() - started_at:.1f}s，任务仍在 {snapshot.get('status')}）",
+                    flush=True,
                 )
-                return
-
-            await asyncio.sleep(_SSE_POLL_INTERVAL)
-
-            # 心跳：长时间没有状态变化时，避免网关/浏览器把空闲连接掐断
-            if time.time() - last_heartbeat >= _SSE_HEARTBEAT_SECONDS:
-                yield ": ping\n\n"
-                last_heartbeat = time.time()
 
     return StreamingResponse(
         event_generator(),

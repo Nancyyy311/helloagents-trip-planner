@@ -216,7 +216,7 @@ def test_gate_rejects_when_saturated(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "ok"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "ok"),
     )
     guard.plan_gate.reset(limit=1)
     assert guard.plan_gate.try_enter() is True
@@ -234,7 +234,7 @@ def test_gate_rejects_when_saturated(monkeypatch):
 def test_gate_released_even_when_generation_raises(monkeypatch):
     """失败路径必须归还名额，否则一次异常就把容量永久吃掉一格。"""
 
-    def boom(req):
+    def boom(req, cancel_token=None):
         raise RuntimeError("LLM 挂了")
 
     monkeypatch.setattr(trip_routes, "_plan_trip_isolated", boom)
@@ -252,7 +252,7 @@ def test_gate_released_even_when_generation_raises(monkeypatch):
 def test_duplicate_request_reuses_inflight_result(monkeypatch):
     """相同请求在飞行中时，后来者直接等结果，不再调一次 LLM。"""
 
-    def should_not_run(req):
+    def should_not_run(req, cancel_token=None):
         raise AssertionError("重复请求不应该再触发一次生成")
 
     monkeypatch.setattr(trip_routes, "_plan_trip_isolated", should_not_run)
@@ -284,7 +284,7 @@ def test_duplicate_request_reuses_inflight_result(monkeypatch):
 def test_inflight_failure_propagates_to_waiter(monkeypatch):
     """leader 失败时，等待方应该拿到 502，而不是挂死。"""
 
-    def should_not_run(req):
+    def should_not_run(req, cancel_token=None):
         raise AssertionError("不应该自己跑")
 
     monkeypatch.setattr(trip_routes, "_plan_trip_isolated", should_not_run)
@@ -308,7 +308,7 @@ def test_different_payload_is_not_coalesced(monkeypatch):
     """城市不同就是不同请求，绝不能合并。"""
     calls = []
 
-    def fake(req):
+    def fake(req, cancel_token=None):
         calls.append(req.city)
         return _fake_plan(city=req.city), "llm_success", "ok"
 
@@ -327,7 +327,7 @@ def test_concurrent_refine_returns_409(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "ok"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "ok"),
     )
     plan_id = client.post("/api/trip/plan", json=SAMPLE).json()["plan_id"]
 
@@ -349,11 +349,11 @@ def test_refine_claim_released_after_failure(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_fake_plan(), "llm_success", "ok"),
+        lambda req, cancel_token=None: (_fake_plan(), "llm_success", "ok"),
     )
     plan_id = client.post("/api/trip/plan", json=SAMPLE).json()["plan_id"]
 
-    def boom(req, prev, instruction):
+    def boom(req, prev, instruction, cancel_token=None):
         raise RuntimeError("模型返回空")
 
     monkeypatch.setattr(trip_routes, "_refine_isolated", boom)

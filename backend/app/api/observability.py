@@ -62,6 +62,16 @@ class MetricsRegistry:
         self.planning_rejected = 0
         self.coalesced_requests = 0
         self.refine_conflicts = 0
+        # 任务生命周期指标：取消/孤儿回收/断连。
+        # 这三个数回答的是同一个问题——"有多少算力花在了没人看的结果上"。
+        # 不计量它就永远是个黑盒：日志里只有一排跑完的耗时，看不出其中一半是白跑的。
+        self.tasks_canceled = 0
+        self.tasks_canceled_by_reason: dict[str, int] = defaultdict(int)
+        self.tasks_canceled_by_stage: dict[str, int] = defaultdict(int)
+        self.tasks_abandoned = 0
+        self.tasks_reaped = 0
+        self.sse_disconnects = 0
+        self.sse_connects = 0
         # Grounding 指标：模型编造了多少 POI / 坐标
         self.grounding_checked = 0
         self.grounding_verified = 0
@@ -161,6 +171,42 @@ class MetricsRegistry:
         """记录一次"同一计划并发修改"被拒。"""
         with self._lock:
             self.refine_conflicts += 1
+
+    def record_task_canceled(self, reason: str, stage: str = "") -> None:
+        """记录一次任务被取消，同时按"为什么取消"和"停在哪一步"分开计数。
+
+        只看总数没法指导优化：`client_deleted` 是用户行为，改不了；
+        `orphan_reclaimed` 高说明前端断了却没关任务，那是前端要修的 bug；
+        `stage` 集中在 `before_llm` 说明取消生效得很及时（还没花钱），
+        集中在 `candidate_2_start` 说明喊停时已经有候选在飞了（钱已经花了）。
+        """
+        with self._lock:
+            self.tasks_canceled += 1
+            self.tasks_canceled_by_reason[reason or "unknown"] += 1
+            self.tasks_canceled_by_stage[stage or "unknown"] += 1
+
+    def record_task_abandoned(self) -> None:
+        """记录一次孤儿任务回收（提交后既没轮询也没订阅，判定为已经没人要了）。"""
+        with self._lock:
+            self.tasks_abandoned += 1
+
+    def record_task_reaped(self) -> None:
+        """记录一次后台清扫掉的过期任务（修复：原来只有提交新任务时才顺手清）。"""
+        with self._lock:
+            self.tasks_reaped += 1
+
+    def record_sse_connect(self) -> None:
+        with self._lock:
+            self.sse_connects += 1
+
+    def record_sse_disconnect(self) -> None:
+        """记录一次 SSE 客户端断开。
+
+        这个数原项目完全没有：浏览器关掉后连接就安静消失了，日志上什么都看不到，
+        而同一时刻后台可能还有 3 个候选在跑。
+        """
+        with self._lock:
+            self.sse_disconnects += 1
 
     def record_grounding(self, summary) -> None:
         """记录一次 Grounding 校验结果（模型编造率）。
@@ -264,6 +310,14 @@ class MetricsRegistry:
                 "planning_rejected": self.planning_rejected,
                 "coalesced_requests": self.coalesced_requests,
                 "refine_conflicts": self.refine_conflicts,
+                # 改造点：任务生命周期——"有多少算力花在没人看的结果上"
+                "tasks_canceled": self.tasks_canceled,
+                "tasks_canceled_by_reason": dict(self.tasks_canceled_by_reason),
+                "tasks_canceled_by_stage": dict(self.tasks_canceled_by_stage),
+                "tasks_abandoned": self.tasks_abandoned,
+                "tasks_reaped": self.tasks_reaped,
+                "sse_connects": self.sse_connects,
+                "sse_disconnects": self.sse_disconnects,
             }
 
 

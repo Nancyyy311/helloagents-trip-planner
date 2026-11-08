@@ -82,7 +82,7 @@ def test_plan_response_contains_plan_id(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (_trip([["故宫"], ["天坛"], ["颐和园"]]), "llm_success", "生成成功"),
+        lambda req, cancel_token=None: (_trip([["故宫"], ["天坛"], ["颐和园"]]), "llm_success", "生成成功"),
     )
     r = client.post("/api/trip/plan", json=SAMPLE)
     assert r.status_code == 200, r.text
@@ -111,12 +111,12 @@ def test_refine_only_changes_target_day(monkeypatch):
     monkeypatch.setattr(
         trip_routes,
         "_plan_trip_isolated",
-        lambda req: (original, "llm_success", "生成成功"),
+        lambda req, cancel_token=None: (original, "llm_success", "生成成功"),
     )
     monkeypatch.setattr(
         trip_routes,
         "_refine_isolated",
-        lambda req, prev, instruction: (refined, "llm_success", "增量修改成功"),
+        lambda req, prev, instruction, cancel_token=None: (refined, "llm_success", "增量修改成功"),
     )
 
     created = client.post("/api/trip/plan", json=SAMPLE).json()
@@ -148,11 +148,11 @@ def test_refine_reports_budget_delta(monkeypatch):
 
     monkeypatch.setattr(
         trip_routes, "_plan_trip_isolated",
-        lambda req: (original, "llm_success", "生成成功"),
+        lambda req, cancel_token=None: (original, "llm_success", "生成成功"),
     )
     monkeypatch.setattr(
         trip_routes, "_refine_isolated",
-        lambda req, prev, instruction: (refined, "llm_success", "增量修改成功"),
+        lambda req, prev, instruction, cancel_token=None: (refined, "llm_success", "增量修改成功"),
     )
     plan_id = client.post("/api/trip/plan", json=SAMPLE).json()["plan_id"]
 
@@ -171,7 +171,7 @@ def test_refine_failure_returns_502_and_keeps_original(monkeypatch):
     original = _trip([["故宫"], ["天坛"], ["颐和园"]])
     monkeypatch.setattr(
         trip_routes, "_plan_trip_isolated",
-        lambda req: (original, "llm_success", "生成成功"),
+        lambda req, cancel_token=None: (original, "llm_success", "生成成功"),
     )
 
     def _boom(req, prev, instruction):
@@ -187,7 +187,7 @@ def test_refine_failure_returns_502_and_keeps_original(monkeypatch):
     # 原 plan_id 仍然可以再改一次（说明存储没被破坏）
     monkeypatch.setattr(
         trip_routes, "_refine_isolated",
-        lambda req, prev, instruction: (original, "llm_success", "增量修改成功"),
+        lambda req, prev, instruction, cancel_token=None: (original, "llm_success", "增量修改成功"),
     )
     r2 = client.post(f"/api/trip/plan/{plan_id}/refine", json={"instruction": "再改一次"})
     assert r2.status_code == 200
@@ -199,15 +199,15 @@ def test_refine_supports_multiple_rounds(monkeypatch):
     v2 = _trip([["故宫"], ["国家博物馆"], ["颐和园"]])
     v3 = _trip([["故宫"], ["国家博物馆"], ["798艺术区"]])
 
-    monkeypatch.setattr(trip_routes, "_plan_trip_isolated", lambda req: (v1, "llm_success", "ok"))
-    monkeypatch.setattr(trip_routes, "_refine_isolated", lambda req, prev, i: (v2, "llm_success", "ok"))
+    monkeypatch.setattr(trip_routes, "_plan_trip_isolated", lambda req, cancel_token=None: (v1, "llm_success", "ok"))
+    monkeypatch.setattr(trip_routes, "_refine_isolated", lambda req, prev, i, cancel_token=None: (v2, "llm_success", "ok"))
     first = client.post("/api/trip/plan", json=SAMPLE).json()
 
     r1 = client.post(f"/api/trip/plan/{first['plan_id']}/refine", json={"instruction": "第二天改室内"})
     second = r1.json()
     assert second["plan_id"] != first["plan_id"]
 
-    monkeypatch.setattr(trip_routes, "_refine_isolated", lambda req, prev, i: (v3, "llm_success", "ok"))
+    monkeypatch.setattr(trip_routes, "_refine_isolated", lambda req, prev, i, cancel_token=None: (v3, "llm_success", "ok"))
     r2 = client.post(f"/api/trip/plan/{second['plan_id']}/refine", json={"instruction": "第三天改艺术区"})
     assert r2.status_code == 200
     assert r2.json()["data"]["days"][2]["attractions"][0]["name"] == "798艺术区"
