@@ -9,7 +9,11 @@ export const API_BASE_URL = configuredApiBaseUrl
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 600000, // 10分钟超时
+  // 必须大于后端的 PLANNER_REQUEST_TIMEOUT（600s）。
+  // 两边都设 600000 时，前端几乎必然先触发超时（还要叠加网络和序列化开销），
+  // 于是用户看到的是 axios 的 "timeout of 600000ms exceeded"，
+  // 后端那条"模型超时"的明确报错永远没机会返回。
+  timeout: 900000, // 15 分钟
   headers: {
     'Content-Type': 'application/json'
   }

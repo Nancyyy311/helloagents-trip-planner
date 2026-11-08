@@ -421,9 +421,9 @@ onMounted(async () => {
   const data = sessionStorage.getItem('tripPlan')
   if (data) {
     tripPlan.value = JSON.parse(data)
-    // 加载景点图片
-    await loadAttractionPhotos()
-    // 回填缺失的餐饮坐标,旧session里的结果也尽量能显示餐厅点位
+    // 景点图片只是装饰，失败/慢都不该挡住地图：不 await，后台加载完自己刷新
+    void loadAttractionPhotos()
+    // 餐饮坐标回填会影响地图标记，需要等；内部每个请求都带 8s 超时兜底
     await loadMissingMealLocations()
     // 等待DOM渲染完成后初始化地图
     await nextTick()
@@ -560,6 +560,24 @@ const getWeatherCardClass = (dayWeather: unknown, nightWeather: unknown): string
   return 'weather-card-sun'
 }
 
+// 带超时的 fetch。
+// 原实现用的是裸 fetch，浏览器默认超时长达数分钟，
+// 而这两个请求都在 onMounted 里被 await —— 只要有一个挂住，
+// 后面的 initMaps() 就永远不执行，结果页的地图直接白屏。
+const fetchJsonWithTimeout = async (url: string, timeoutMs = 8000): Promise<any> => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { signal: controller.signal })
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`)
+    }
+    return await res.json()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // 加载所有景点图片
 const loadAttractionPhotos = async () => {
   if (!tripPlan.value) return
@@ -568,8 +586,7 @@ const loadAttractionPhotos = async () => {
 
   tripPlan.value.days.forEach(day => {
     day.attractions.forEach(attraction => {
-      const promise = fetch(`${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
-        .then(res => res.json())
+      const promise = fetchJsonWithTimeout(`${API_BASE_URL}/api/poi/photo?name=${encodeURIComponent(attraction.name)}`)
         .then(data => {
           if (data.success && data.data.photo_url) {
             attractionPhotos.value[attraction.name] = data.data.photo_url
@@ -603,10 +620,9 @@ const loadMissingMealLocations = async () => {
         return
       }
 
-      const promise = fetch(
+      const promise = fetchJsonWithTimeout(
         `${API_BASE_URL}/api/poi/search?keywords=${encodeURIComponent(meal.name)}&city=${encodeURIComponent(tripPlan.value!.city)}&source_role=food`
       )
-        .then(res => res.json())
         .then(data => {
           const poi = Array.isArray(data.data)
             ? data.data.find((item: any) => isValidLocation(item.location))
