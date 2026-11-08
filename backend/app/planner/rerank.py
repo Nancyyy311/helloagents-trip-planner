@@ -172,6 +172,15 @@ def score_trip_plan_candidate(
     )
     arithmetic_consistent = budget_arithmetic_consistent(trip_plan)
 
+    # 软预算也要有"超了就扣分"的梯度。原来只有 strictness=hard 才真的拦，
+    # 软约束下超 30% 和不超预算得分一样——评测里青岛就是这么超出去的。
+    amount = _safe_int(request.budget_constraint.amount)
+    budget_overshoot_ratio = 0.0
+    if amount > 0:
+        budget_overshoot_ratio = round(
+            max(0.0, (recomputed_budget["total"] - amount) / amount), 4
+        )
+
     return {
         "attraction_grounding_rate": _metric_rate(attraction_hit, attraction_total),
         "attraction_grounding_ok": attraction_hit == attraction_total and attraction_total > 0,
@@ -192,6 +201,7 @@ def score_trip_plan_candidate(
         "attraction_budget_party_relation_ok": budget_relationship["attraction_budget_party_relation_ok"],
         "meal_cost_scale_ok": budget_relationship["meal_cost_scale_ok"],
         "budget_arithmetic_consistent": arithmetic_consistent,
+        "budget_overshoot_ratio": budget_overshoot_ratio,
         "recomputed_budget_total": recomputed_budget["total"],
         "recomputed_budget": recomputed_budget,
         "budget_target_min_total": budget_fit["target_min_total"],
@@ -222,6 +232,12 @@ def score_rerank_metrics(metrics: Dict[str, Any]) -> float:
 
     score += 4.0 if metrics.get("budget_arithmetic_consistent") else 0.0
     score += max(0.0, float(metrics.get("budget_fit_closeness") or 0.0)) * 6.0
+
+    # 软预算超支惩罚：超 10% 扣 10，超 30% 扣 30，封顶 30。
+    # 不设下限是因为"严重超支"已经由 budget_hard_constraint_ok 处理（-40）。
+    overshoot_ratio = float(metrics.get("budget_overshoot_ratio") or 0.0)
+    if overshoot_ratio > 0:
+        score -= min(30.0, overshoot_ratio * 100.0)
 
     return round(score, 4)
 

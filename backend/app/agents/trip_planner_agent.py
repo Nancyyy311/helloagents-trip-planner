@@ -18,6 +18,7 @@ from .planner_feedback import (
     is_non_retryable_llm_error,
     log_preference_candidates,
 )
+from ..planner.budget import describe_budget_fix, normalize_budget
 from ..planner.cancel import CancelToken, PlanCancelled
 from ..planner.context import PlannerContextBuilder
 from ..planner.grounding import verify_trip_plan
@@ -909,6 +910,11 @@ class MultiAgentTripPlanner:
                 # 放在 validate 之前：后面的业务校验可以直接复用这份结果，不必重算。
                 verify_trip_plan(trip_plan, planner_context)
                 metrics.record_grounding(trip_plan.grounding)
+                # 改造点：预算总额不再采信模型的自报数，按 POI 单价重算覆盖。
+                # 实测 18 条里 11 条对不上账（房间数乘错），属于用户一眼能发现的错。
+                budget_note = normalize_budget(trip_plan, request)
+                if budget_note["changed"]:
+                    print(describe_budget_fix(budget_note), flush=True)
             validate_trip_plan_shape(trip_plan, request, planner_context)
 
             return trip_plan
