@@ -273,39 +273,20 @@
           </a-form-item>
 
           <a-form-item v-if="loading">
-            <div class="loading-container">
-              <a-progress
-                :percent="loadingProgress"
-                status="active"
-                :stroke-color="{
-                  '0%': '#0f766e',
-                  '100%': '#2563eb',
-                }"
-                :stroke-width="8"
-              />
-              <p class="loading-status">
-                {{ loadingStatus }}
-              </p>
-              <!-- 改造点：生成过程中可以主动放弃。
-                   后端批次9 已实现 DELETE /plan/async/{id}（pending 立即取消，
-                   running 在下一个检查点停下）。但此前前端只接了 pagehide——
-                   也就是说"关掉整个页面"才会触发取消，用户想换个城市重来时
-                   只能干等 15 秒。这里补上显式入口，取消能力才算闭环。 -->
-              <a-button
-                v-if="loading && !cancelRequested"
-                danger
-                size="small"
-                type="text"
-                class="cancel-button"
-                @click="handleCancel"
-              >
-                <CloseCircleOutlined />
-                <span>取消生成</span>
-              </a-button>
-              <p v-else-if="cancelRequested" class="cancel-hint">
-                ⏹️ 已请求取消，正在等待当前步骤结束...
-              </p>
-            </div>
+            <!-- 改造点：生成过程中可以主动放弃。
+                 后端批次9 已实现 DELETE /plan/async/{id}（pending 立即取消，
+                 running 在下一个检查点停下）。但此前前端只接了 pagehide——
+                 也就是说"关掉整个页面"才会触发取消，用户想换个城市重来时
+                 只能干等 15 秒。
+                 批次19 用户反馈"页面里根本没看到取消界面"：按钮原本是
+                 type="text" size="small" 的文字按钮，藏在进度条下方，看着像
+                 脚注。已抽成 GeneratingPanel 并改成实心红色按钮。 -->
+            <GeneratingPanel
+              :percent="loadingProgress"
+              :status="loadingStatus"
+              :cancel-requested="cancelRequested"
+              @cancel="handleCancel"
+            />
           </a-form-item>
         </a-form>
       </a-card>
@@ -319,12 +300,12 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
   CarOutlined,
-  CloseCircleOutlined,
   EditOutlined,
   EnvironmentOutlined,
   RocketOutlined,
   TeamOutlined
 } from '@ant-design/icons-vue'
+import GeneratingPanel from '@/components/GeneratingPanel.vue'
 import { cancelPlanTask, generateTripPlan } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
@@ -868,34 +849,6 @@ const handleSubmit = async () => {
 
 .submit-button:active {
   transform: translateY(0);
-}
-
-.loading-container {
-  text-align: center;
-  padding: 20px;
-  border: 1px dashed #1677ff;
-  border-radius: 8px;
-  background: #f7fbff;
-}
-
-.loading-status {
-  margin: 14px 0 0;
-  color: #0958d9;
-  font-size: 15px;
-  font-weight: 650;
-}
-
-.cancel-button {
-  margin-top: 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.cancel-hint {
-  margin: 10px 0 0;
-  color: #d46b08;
-  font-size: 13px;
 }
 
 @media (max-width: 960px) {
