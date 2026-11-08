@@ -78,7 +78,7 @@
 | SSE 流式推送 | `GET /plan/async/{id}/stream`，状态一变就推，15s 心跳，600s 超时，`X-Accel-Buffering: no` | 一次连接拿到底，省掉轮询空转 |
 | JSON 解析鲁棒性 | 支持前后说明文字、代码块、尾逗号、中文引号、BOM、**截断补全**；仍失败才抛错 | 直接消掉一大批"解析失败 → 重跑 40s" |
 | 弃用 API 清理 | `@app.on_event` → `lifespan`；`Field(example=)` → `json_schema_extra`；`class Config` → `model_config` | 弃用警告 **27 → 1**（剩下 1 个在第三方库） |
-| 回归测试 | `pytest` **92 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
+| 回归测试 | `pytest` **216 个用例** + 前端 `vitest` **28 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
 
 ### 维度 E · 真 Agent（把"伪工具调用"补成真调用）
 
