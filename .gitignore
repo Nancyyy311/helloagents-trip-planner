@@ -122,3 +122,6 @@ lightning_logs/
 *.tgz
 *.rar
 *.7z
+
+# E2E 冒烟截图（本地跑 test:e2e:cancel 产生）
+frontend/.e2e-shots/

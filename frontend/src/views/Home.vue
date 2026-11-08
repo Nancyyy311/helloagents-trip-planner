@@ -281,12 +281,14 @@
                  批次19 用户反馈"页面里根本没看到取消界面"：按钮原本是
                  type="text" size="small" 的文字按钮，藏在进度条下方，看着像
                  脚注。已抽成 GeneratingPanel 并改成实心红色按钮。 -->
-            <GeneratingPanel
-              :percent="loadingProgress"
-              :status="loadingStatus"
-              :cancel-requested="cancelRequested"
-              @cancel="handleCancel"
-            />
+            <div ref="generatingRef" class="generating-slot">
+              <GeneratingPanel
+                :percent="loadingProgress"
+                :status="loadingStatus"
+                :cancel-requested="cancelRequested"
+                @cancel="handleCancel"
+              />
+            </div>
           </a-form-item>
         </a-form>
       </a-card>
@@ -295,7 +297,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue'
+import { nextTick, ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
@@ -319,6 +321,9 @@ const loadingStatus = ref('')
 const currentTaskId = ref<string | null>(null)
 // 已经点过取消：按钮换成"等待停止"的提示，避免连点
 const cancelRequested = ref(false)
+// 生成面板的 DOM：点完生成要把它滚进视口，否则按钮在屏幕外等于不存在。
+// 批次19 实测：1280x1000 窗口下按钮位于 y≈1514，用户不滚动根本看不到。
+const generatingRef = ref<HTMLElement | null>(null)
 
 /** 用户主动放弃当前生成。 */
 const handleCancel = async () => {
@@ -471,6 +476,11 @@ const handleSubmit = async () => {
   loading.value = true
   loadingProgress.value = 0
   loadingStatus.value = '正在初始化...'
+  // 面板插在提交按钮下方，页面一长就落到视口外。等 DOM 更新后主动滚进去，
+  // 保证"取消"这个入口不需要用户先想到往下拉才看得见。
+  nextTick(() => {
+    generatingRef.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
   // 每次新提交都要清掉上一轮的取消态，否则按钮会一直是"等待停止"
   cancelRequested.value = false
   currentTaskId.value = null
