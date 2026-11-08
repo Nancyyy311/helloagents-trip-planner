@@ -36,6 +36,21 @@ from .prompts import (
 )
 
 
+class PlannerCandidateError(RuntimeError):
+    """候选失败时，把模型的原始输出一起带出来。
+
+    并行改造时踩的坑（自查发现）：原来串行路径在 except 里能直接拿到
+    `planner_response` 变量，改成线程池之后 response 是 `_one()` 的局部变量，
+    `future.result()` 抛异常时它已经丢了 —— 于是失败记录里 `rejected` 字段
+    全是空字符串，那套"把失败样本留作 DPO 训练数据"的机制等于停摆。
+    让异常携带原文后，写 jsonl、事后归因 prompt 问题都有据可查。
+    """
+
+    def __init__(self, message: str, raw_response: str = "") -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
+
+
 PLANNER_MAX_ATTEMPTS = 5
 PLANNER_REQUEST_TIMEOUT = int(os.getenv("PLANNER_REQUEST_TIMEOUT", "600"))
 PLANNER_TEMPERATURE = float(os.getenv("PLANNER_TEMPERATURE", "0.2"))
@@ -457,12 +472,17 @@ class MultiAgentTripPlanner:
                 ),
             )
             self._log_timer(f"{label} 候选{index + 1} LLM调用", started_at)
-            trip_plan = self._parse_response(
-                response,
-                request,
-                use_fallback=False,
-                planner_context=planner_context,
-            )
+            try:
+                trip_plan = self._parse_response(
+                    response,
+                    request,
+                    use_fallback=False,
+                    planner_context=planner_context,
+                )
+            except Exception as error:
+                # 必须在这里包一层：response 是当前帧的局部变量，
+                # 一旦把异常抛回主线程，原始输出就再也拿不到了。
+                raise PlannerCandidateError(str(error), raw_response=response) from error
             return index + 1, trip_plan
 
         valid: List[tuple[int, TripPlan]] = []
@@ -477,8 +497,11 @@ class MultiAgentTripPlanner:
                 try:
                     valid.append(future.result())
                 except Exception as error:
+                    # 包装异常的 error_type 会丢失"到底是 JSON 没找到还是 schema 不合法"，
+                    # 归因时只认根因，所以往下取 __cause__。
+                    root_error = getattr(error, "__cause__", None) or error
                     print(
-                        f"⚠️  {label} 候选{attempt_index} 生成/解析失败: {error}",
+                        f"⚠️  {label} 候选{attempt_index} 生成/解析失败: {root_error}",
                         flush=True,
                     )
                     failure = build_failure_row(
@@ -487,8 +510,10 @@ class MultiAgentTripPlanner:
                         max_attempts=target_candidate_count,
                         request=request,
                         planner_query=planner_query,
-                        response="",
-                        error=error,
+                        # 改造点：原来这里写死 ""，导致并行路径的失败样本全丢原文；
+                        # 现在从异常里取回模型真实输出，失败样本才能用于归因/训练。
+                        response=getattr(error, "raw_response", "") or "",
+                        error=root_error,
                         preference_reason="parallel_candidate_failed",
                     )
                     failures.append(failure)
