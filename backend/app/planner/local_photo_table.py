@@ -25,6 +25,7 @@
    下载再慢也不碰事件循环——这正是原 bug 的镜像修复。
 """
 
+import hashlib
 import re
 import threading
 from pathlib import Path
@@ -106,37 +107,49 @@ PHOTO_ID_BY_KEYWORD: Dict[str, str] = {
     "回民街": NEON_STREET,
     "步行街": NEON_STREET,
     "夜市": NEON_STREET,
+    # 南京（批次11.1：真机反馈"同城景点全是同一张图"后补的关键词）
+    "玄武湖": ALPINE_LAKE,
+    "中山陵": FOREST_PATH,
+    "明孝陵": FOREST_PATH,
+    "灵谷寺": FOREST_PATH,
+    "夫子庙": RIVER_CITY,
+    "秦淮": RIVER_CITY,
+    "梧桐大道": RIVER_CITY,
 }
 
-# === 城市 → 图片（关键词未命中时的城市级兜底） ===
-PHOTO_ID_BY_CITY: Dict[str, str] = {
-    "上海": SHANGHAI_BUND,
-    "三亚": BEACH_SUNSET,
-    "厦门": BEACH_SUNSET,
-    "青岛": BEACH_SUNSET,
-    "大连": BEACH_SUNSET,
-    "珠海": BEACH_SUNSET,
-    "北海": BEACH_SUNSET,
-    "秦皇岛": BEACH_SUNSET,
-    "重庆": NEON_STREET,
-    "长沙": NEON_STREET,
-    "成都": NEON_STREET,
-    "西安": NEON_STREET,
-    "张家界": VALLEY_RIVER,
-    "黄山": MOUNTAIN_DAWN,
-    "桂林": VALLEY_RIVER,
-    "杭州": ALPINE_LAKE,
-    "苏州": RIVER_CITY,
-    "无锡": RIVER_CITY,
-    "绍兴": RIVER_CITY,
-    "南京": CITY_SKYLINE,
-    "深圳": CITY_SKYLINE,
-    "广州": CITY_SKYLINE,
-    "北京": CITY_MORNING,
-    "天津": CITY_SKYLINE,
-    "武汉": CITY_SKYLINE,
-    "郑州": CITY_MORNING,
-    "洛阳": CITY_MORNING,
+# === 城市 → 图片池（关键词未命中时的城市级兜底） ===
+# 批次11.1：真机截图发现同城 3 个景点渲染出同一张图——
+# 单值映射 + 全部落到同一个兜底是必然结果。改成图片池 +
+# 按景点名确定性轮换（hashlib 而非内置 hash：后者每次进程重启随机化，
+# 同一景点刷新页面后换图反而更奇怪）。
+PHOTO_POOL_BY_CITY: Dict[str, List[str]] = {
+    "上海": [SHANGHAI_BUND, CITY_SKYLINE, RIVER_CITY],
+    "南京": [CITY_MORNING, RIVER_CITY, CITY_SKYLINE],
+    "三亚": [BEACH_SUNSET, ALPINE_LAKE],
+    "厦门": [BEACH_SUNSET, RIVER_CITY],
+    "青岛": [BEACH_SUNSET, CITY_SKYLINE],
+    "大连": [BEACH_SUNSET, CITY_SKYLINE],
+    "珠海": [BEACH_SUNSET, RIVER_CITY],
+    "北海": [BEACH_SUNSET],
+    "秦皇岛": [BEACH_SUNSET],
+    "重庆": [NEON_STREET, RIVER_CITY],
+    "长沙": [NEON_STREET, CITY_SKYLINE],
+    "成都": [NEON_STREET, FOREST_PATH],
+    "西安": [NEON_STREET, CITY_MORNING],
+    "张家界": [VALLEY_RIVER],
+    "黄山": [MOUNTAIN_DAWN],
+    "桂林": [VALLEY_RIVER],
+    "杭州": [ALPINE_LAKE],
+    "苏州": [RIVER_CITY],
+    "无锡": [RIVER_CITY],
+    "绍兴": [RIVER_CITY],
+    "深圳": [CITY_SKYLINE, CITY_MORNING],
+    "广州": [CITY_SKYLINE, CITY_MORNING],
+    "北京": [CITY_MORNING, CITY_SKYLINE],
+    "天津": [CITY_SKYLINE, RIVER_CITY],
+    "武汉": [CITY_SKYLINE, RIVER_CITY],
+    "郑州": [CITY_MORNING],
+    "洛阳": [CITY_MORNING, FOREST_PATH],
 }
 
 # 关键词匹配时按长度优先："亚龙湾热带天堂森林公园" 应命中更具体的词
@@ -146,8 +159,23 @@ _KEYWORDS_BY_LENGTH: List[str] = sorted(PHOTO_ID_BY_KEYWORD, key=len, reverse=Tr
 _CITY_ALIASES = ("市", "地区", "自治州")
 
 
+def _stable_slot(name: str, pool_size: int) -> int:
+    """景点名 → 池内槽位的确定性映射。
+
+    用 hashlib 而不是内置 hash()：后者默认对 str 随机化
+    （PYTHONHASHSEED），同一景点重启后端就会换图——
+    页面上"刷新一次换个样子"反而像 bug。
+    """
+    digest = hashlib.md5(name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % pool_size
+
+
 def lookup_photo_id(name: str, city: str = "") -> Optional[str]:
     """按 景点关键词 → 城市 两级查表，命中返回图片 id，未命中返回 None。
+
+    批次11.1：城市兜底从单值改为图片池——真机截图发现同城多个景点
+    全渲染成同一张图。池内按景点名确定性轮换，同一景点永远拿到
+    同一张（不闪烁），不同景点尽量岔开（不千篇一律）。
 
     未命中不是失败：前端有带景点名的渐变占位图兜底，
     视觉上是设计过的卡片而不是裂图。
@@ -160,7 +188,12 @@ def lookup_photo_id(name: str, city: str = "") -> Optional[str]:
     for keyword in _KEYWORDS_BY_LENGTH:
         if keyword and keyword in clean_name:
             return PHOTO_ID_BY_KEYWORD[keyword]
-    return PHOTO_ID_BY_CITY.get(clean_city)
+    pool = PHOTO_POOL_BY_CITY.get(clean_city)
+    if not pool:
+        return None
+    if len(pool) == 1:
+        return pool[0]
+    return pool[_stable_slot(clean_name, len(pool))]
 
 
 def photo_cdn_url(photo_id: str) -> str:
@@ -168,8 +201,14 @@ def photo_cdn_url(photo_id: str) -> str:
     return PHOTO_CDN_URL.format(photo_id=photo_id)
 
 
-# === 磁盘缓存 ===
-# backend/.cache/photos/。.gitignore 应包含 .cache/。
+# === 磁盘缓存与种子图 ===
+# 批次11.1：CDN 实测抖动剧烈（同一 URL 五连请求 2 次残缺），
+# 下载失败时同图的所有请求会在锁上排队最多 重试×超时 秒。
+# 所以把 11 张核验过的图直接随仓库分发（photo_assets/，共约 1.2MB），
+# 运行时零外网依赖；CDN 下载降级为"往表里加新图"的更新通道。
+# 判定标准是完整 JPEG（FFD8 开头 / FFD9 结尾）——
+# 实测 CDN 抖动时会返回截断文件，curl/python 都可能拿到 200 + 半张图。
+SEED_DIR = Path(__file__).with_name("photo_assets")
 CACHE_DIR = Path(
     __import__("os").getenv(
         "PHOTO_CACHE_DIR",
@@ -190,18 +229,40 @@ def is_valid_photo_id(photo_id: str) -> bool:
     return bool(_photo_id_pattern.match(photo_id or "")) and photo_id in KNOWN_PHOTO_IDS
 
 
+def seed_photo_path(photo_id: str) -> Path:
+    """仓库内置的种子图路径（随代码分发，永远可用）。"""
+    return SEED_DIR / f"{photo_id}.jpg"
+
+
 def cached_photo_path(photo_id: str) -> Path:
+    """运行时下载缓存路径（仅 CDN 兜底通道使用）。"""
     return CACHE_DIR / f"{photo_id}.jpg"
 
 
-def load_photo_bytes(photo_id: str) -> Optional[bytes]:
-    """读缓存的图片字节；缓存未命中则下载一次并落盘。失败返回 None。
+def _is_complete_jpeg(data: bytes) -> bool:
+    """完整 JPEG 判定：SOI 头 + EOI 尾。CDN 抖动会送来 200 + 截断文件。"""
+    return len(data) > 1000 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"
 
+
+def load_photo_bytes(photo_id: str) -> Optional[bytes]:
+    """图片字节读取：种子图 → 磁盘缓存 → CDN 下载，失败返回 None。
+
+    三级来源的设计动机（面试可直接讲）：
+    - 种子图随仓库分发：运行时零外网依赖，演示/断网/CI 都 100% 可用；
+    - 磁盘缓存：将来往表里加新图时，首个请求下载一次就固化；
+    - CDN 下载放最后且带重试：只影响首次，不影响已固化图片。
     并发安全：同一 photo_id 用独立的锁串行化下载，
     10 个景点共用一张城市图时也只会发起 1 次 CDN 请求。
     """
     if not is_valid_photo_id(photo_id):
         return None
+
+    seed = seed_photo_path(photo_id)
+    if seed.is_file() and seed.stat().st_size > 0:
+        try:
+            return seed.read_bytes()
+        except OSError:
+            pass  # 种子图读失败才走缓存/下载通道
 
     path = cached_photo_path(photo_id)
     if path.is_file() and path.stat().st_size > 0:
@@ -224,7 +285,9 @@ def load_photo_bytes(photo_id: str) -> Optional[bytes]:
                 resp = requests.get(photo_cdn_url(photo_id), timeout=_DOWNLOAD_TIMEOUT)
                 resp.raise_for_status()
                 data = resp.content
-                if len(data) < 1000:  # CDN 报错也常返回 200 + 短 JSON
+                # 完整性校验：CDN 抖动实测会给 200 + 截断文件，
+                # 不校验的话前端会渲染出半张裂图
+                if not _is_complete_jpeg(data):
                     continue
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(".tmp")

@@ -43,8 +43,31 @@ class TestLookupPhotoId:
         )
 
     def test_city_fallback_with_suffix(self):
-        # "三亚市" 应去后缀命中城市表
-        assert lpt.lookup_photo_id("某个无名公园", "三亚市") == lpt.BEACH_SUNSET
+        # "三亚市" 应去后缀命中城市图片池（池内任一张都算命中）
+        assert (
+            lpt.lookup_photo_id("某个无名公园", "三亚市") in lpt.PHOTO_POOL_BY_CITY["三亚"]
+        )
+
+    def test_city_pool_rotates_across_attractions(self):
+        # 批次11.1 的直接动因：真机截图里同城 3 个景点渲染成同一张图。
+        # 池足够大时，不同景点必须能岔开（至少出现两种图）
+        names = ["鸡鸣汤包", "芳芳饺子馆", "鼓楼公园", "颐和路公馆区",
+                 "先锋书店", "德基广场", "老门东", "金陵图书馆"]
+        ids = {lpt.lookup_photo_id(n, "南京") for n in names}
+        assert len(ids) >= 2, f"8 个南京景点只出现 {len(ids)} 种图，轮换失效"
+
+    def test_city_pool_assignment_is_deterministic(self):
+        # 同一景点必须永远拿到同一张图（否则刷新页面就换样，像 bug）。
+        # 实现上必须用 hashlib 而不是内置 hash（后者随进程随机化）
+        a = lpt.lookup_photo_id("颐和路公馆区", "南京")
+        for _ in range(3):
+            assert lpt.lookup_photo_id("颐和路公馆区", "南京") == a
+
+    def test_nanjing_keywords_hit(self):
+        # 南京标志性景点补了关键词，不再全落城市兜底
+        assert lpt.lookup_photo_id("中山陵景区", "南京") == lpt.FOREST_PATH
+        assert lpt.lookup_photo_id("夫子庙秦淮风光带", "南京") == lpt.RIVER_CITY
+        assert lpt.lookup_photo_id("玄武湖景区", "南京") == lpt.ALPINE_LAKE
 
     def test_miss_returns_none(self):
         # 未命中必须显式返回 None（不是随机塞一张城市图），
@@ -92,8 +115,9 @@ class TestPhotoEndpoint:
 class TestPhotoAssetEndpoint:
     @pytest.fixture(autouse=True)
     def _isolate_cache(self, tmp_path, monkeypatch):
-        # 每个用例独立的缓存目录，互不污染、不动真实 .cache/
-        monkeypatch.setattr(lpt, "CACHE_DIR", tmp_path)
+        # 每个用例独立的缓存与种子目录，互不污染、不动真实 .cache/ 与 photo_assets/
+        monkeypatch.setattr(lpt, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(lpt, "SEED_DIR", tmp_path / "no_seeds")
         yield
 
     def _stub_download(self, monkeypatch, payload: bytes, calls: list):
@@ -113,9 +137,34 @@ class TestPhotoAssetEndpoint:
 
         monkeypatch.setattr(lpt.requests, "get", _fake_get)
 
+    def test_seed_image_served_without_network(self, monkeypatch, tmp_path):
+        # 批次11.1：种子图随仓库分发，运行时零外网依赖。
+        # 放一张种子图后，即使"网络函数"会炸，也必须从种子读出
+        def _boom(url, timeout=None):
+            raise AssertionError("有种子图时不应触网")
+
+        monkeypatch.setattr(lpt.requests, "get", _boom)
+        payload = b"\xff\xd8" + b"seed" * 500 + b"\xff\xd9"
+        (tmp_path / "no_seeds").mkdir()
+        (tmp_path / "no_seeds" / f"{lpt.SHANGHAI_BUND}.jpg").write_bytes(payload)
+
+        resp = client.get(f"/api/poi/photo/asset/{lpt.SHANGHAI_BUND}")
+        assert resp.status_code == 200
+        assert resp.content == payload
+
+    def test_truncated_download_is_rejected(self, monkeypatch):
+        # CDN 抖动实测会给 200 + 截断文件：不校验 FFD9 会渲染出半张裂图
+        calls: list = []
+        truncated = b"\xff\xd8" + b"x" * 2000  # 缺 EOI 尾
+        self._stub_download(monkeypatch, truncated, calls)
+
+        resp = client.get(f"/api/poi/photo/asset/{lpt.SHANGHAI_BUND}")
+        assert resp.status_code == 404
+        assert len(calls) == lpt._DOWNLOAD_RETRIES  # 3 次全试过才放弃
+
     def test_serves_image_and_caches_to_disk(self, monkeypatch, tmp_path):
         calls: list = []
-        payload = b"\xff\xd8fakejpeg" * 200  # >1KB，过短内容过滤
+        payload = (b"\xff\xd8fakejpeg" * 199) + b"\xff\xd9"  # >1KB 且 JPEG 完整
         self._stub_download(monkeypatch, payload, calls)
 
         resp = client.get(f"/api/poi/photo/asset/{lpt.SHANGHAI_BUND}")
@@ -127,7 +176,7 @@ class TestPhotoAssetEndpoint:
 
     def test_second_request_reads_cache_no_network(self, monkeypatch):
         calls: list = []
-        payload = b"\xff\xd8fakejpeg" * 200
+        payload = (b"\xff\xd8fakejpeg" * 199) + b"\xff\xd9"
         self._stub_download(monkeypatch, payload, calls)
 
         client.get(f"/api/poi/photo/asset/{lpt.SHANGHAI_BUND}")
@@ -165,7 +214,7 @@ class TestPhotoAssetEndpoint:
             calls.append(url)
             gate.wait(timeout=5)
             return type("R", (), {"status_code": 200, "raise_for_status": lambda s: None,
-                                  "content": b"\xff\xd8" + b"j" * 2000})()
+                                  "content": b"\xff\xd8" + b"j" * 1999 + b"\xff\xd9"})()
 
         monkeypatch.setattr(lpt.requests, "get", _slow_get)
         results: list = []
@@ -182,5 +231,6 @@ class TestPhotoAssetEndpoint:
         gate.set()
         for t in threads:
             t.join(timeout=5)
-        assert all(r == b"\xff\xd8" + b"j" * 2000 for r in results)
+        expected = b"\xff\xd8" + b"j" * 1999 + b"\xff\xd9"
+        assert all(r == expected for r in results)
         assert len(calls) == 1
