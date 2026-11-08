@@ -25,7 +25,7 @@ class POIDetailResponse(BaseModel):
     summary="获取POI详情",
     description="根据POI ID获取详细信息,包括图片"
 )
-async def get_poi_detail(poi_id: str):
+def get_poi_detail(poi_id: str):
     """
     获取POI详情
 
@@ -60,7 +60,7 @@ async def get_poi_detail(poi_id: str):
     summary="搜索POI",
     description="根据关键词搜索POI"
 )
-async def search_poi(
+def search_poi(
     keywords: str,
     city: str = "北京",
     source_role: str = Query(default="food", description="POI类型: food/scenic/hotel")

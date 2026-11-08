@@ -18,7 +18,7 @@ router = APIRouter(prefix="/map", tags=["地图服务"])
     summary="搜索POI",
     description="根据关键词搜索POI(兴趣点)"
 )
-async def search_poi(
+def search_poi(
     keywords: str = Query(..., description="搜索关键词", examples=["故宫"]),
     city: str = Query(..., description="城市", examples=["北京"]),
     citylimit: bool = Query(True, description="是否限制在城市范围内")
@@ -61,7 +61,7 @@ async def search_poi(
     summary="查询天气",
     description="查询指定城市的天气信息"
 )
-async def get_weather(
+def get_weather(
     city: str = Query(..., description="城市名称", examples=["北京"])
 ):
     """
@@ -100,7 +100,7 @@ async def get_weather(
     summary="规划路线",
     description="规划两点之间的路线"
 )
-async def plan_route(request: RouteRequest):
+def plan_route(request: RouteRequest):
     """
     规划路线
 
@@ -142,7 +142,7 @@ async def plan_route(request: RouteRequest):
     summary="健康检查",
     description="检查地图服务是否正常"
 )
-async def health_check():
+def health_check():
     """健康检查（真实探测上游，而不是只数本地的工具数量）。
 
     改造点：原实现只读 `service.mcp_tool._available_tools` 的长度就返回 healthy，
