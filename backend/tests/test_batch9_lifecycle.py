@@ -187,11 +187,21 @@ def test_plan_trip_with_pre_cancelled_token_does_no_network_work(monkeypatch):
 
 
 def test_plan_trip_without_token_behaves_as_before():
-    """没传令牌时 _checkpoint 是空操作，不能影响原有行为。"""
+    """没传令牌时 _checkpoint 是空操作，_sleep_or_cancel 退回普通 sleep。
+
+    原来这个用例只有"调用不抛异常"，等于没断言：如果 _sleep_or_cancel 被改成
+    立即返回，退避重试会退化成忙等（CPU 打满、日志刷屏），用例照样通过。
+    这里补两条硬断言：checkpoint 返回 None，sleep 必须真的消耗时间。
+    """
     planner = _bare_planner(None)
     planner._cancel_token = None
-    planner._checkpoint("anything")  # 不抛即通过
-    planner._sleep_or_cancel(0.01, "backoff")
+
+    assert planner._checkpoint("anything") is None
+
+    started = time.monotonic()
+    planner._sleep_or_cancel(0.05, "backoff")
+    elapsed = time.monotonic() - started
+    assert elapsed >= 0.04, f"无令牌时应真实 sleep 0.05s，实际只用了 {elapsed:.3f}s"
 
 
 def test_parallel_candidates_abort_fast_on_cancel(monkeypatch):
