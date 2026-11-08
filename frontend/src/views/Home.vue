@@ -286,6 +286,25 @@
               <p class="loading-status">
                 {{ loadingStatus }}
               </p>
+              <!-- 改造点：生成过程中可以主动放弃。
+                   后端批次9 已实现 DELETE /plan/async/{id}（pending 立即取消，
+                   running 在下一个检查点停下）。但此前前端只接了 pagehide——
+                   也就是说"关掉整个页面"才会触发取消，用户想换个城市重来时
+                   只能干等 15 秒。这里补上显式入口，取消能力才算闭环。 -->
+              <a-button
+                v-if="loading && !cancelRequested"
+                danger
+                size="small"
+                type="text"
+                class="cancel-button"
+                @click="handleCancel"
+              >
+                <CloseCircleOutlined />
+                <span>取消生成</span>
+              </a-button>
+              <p v-else-if="cancelRequested" class="cancel-hint">
+                ⏹️ 已请求取消，正在等待当前步骤结束...
+              </p>
             </div>
           </a-form-item>
         </a-form>
@@ -300,12 +319,13 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import {
   CarOutlined,
+  CloseCircleOutlined,
   EditOutlined,
   EnvironmentOutlined,
   RocketOutlined,
   TeamOutlined
 } from '@ant-design/icons-vue'
-import { generateTripPlan } from '@/services/api'
+import { cancelPlanTask, generateTripPlan } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
@@ -313,6 +333,23 @@ const router = useRouter()
 const loading = ref(false)
 const loadingProgress = ref(0)
 const loadingStatus = ref('')
+// 当前任务的 id：取消按钮要用它发 DELETE。
+// 放在 ref 里而不是局部变量，是因为取消发生在另一个事件回调（点击）里。
+const currentTaskId = ref<string | null>(null)
+// 已经点过取消：按钮换成"等待停止"的提示，避免连点
+const cancelRequested = ref(false)
+
+/** 用户主动放弃当前生成。 */
+const handleCancel = async () => {
+  const taskId = currentTaskId.value
+  if (!taskId || cancelRequested.value) return
+  cancelRequested.value = true
+  loadingStatus.value = '⏹️ 正在取消...'
+  // reason 会原样落到后端任务的 cancel_reason 字段，
+  // /metrics 里能区分"用户主动取消"和"关页面/孤儿回收"
+  await cancelPlanTask(taskId, 'user_canceled')
+  message.info('已请求取消，正在停止生成')
+}
 
 const companionTypeOptions = [
   { label: '独行', value: 'solo' },
@@ -453,6 +490,9 @@ const handleSubmit = async () => {
   loading.value = true
   loadingProgress.value = 0
   loadingStatus.value = '正在初始化...'
+  // 每次新提交都要清掉上一轮的取消态，否则按钮会一直是"等待停止"
+  cancelRequested.value = false
+  currentTaskId.value = null
 
   // 进度条本身仍是估算（后端的生成阶段不对外暴露细粒度进度），
   // 但**状态文案改用服务端真实状态**：任务模型下能明确区分"排队中"和"生成中"，
@@ -518,6 +558,10 @@ const handleSubmit = async () => {
           serverStatusShown = true
           loadingStatus.value = text
         }
+      },
+      // 拿到 task_id 后取消按钮才有目标可打
+      onSubmitted: (taskId) => {
+        currentTaskId.value = taskId
       }
     })
 
@@ -540,12 +584,22 @@ const handleSubmit = async () => {
     }
   } catch (error: any) {
     clearInterval(progressInterval)
-    message.error(error.message || '生成旅行计划失败,请稍后重试')
+    // 用户自己点的取消不是"失败"：不该弹红色错误框吓人。
+    // 判据用本地标记 + 后端文案双重兜底（后者覆盖"别人取消了同一任务"的情况）。
+    const canceled = cancelRequested.value || /取消|canceled/i.test(String(error?.message || ''))
+    if (canceled) {
+      loadingStatus.value = '⏹️ 已取消'
+      message.info('已取消本次生成')
+    } else {
+      message.error(error.message || '生成旅行计划失败,请稍后重试')
+    }
   } finally {
     setTimeout(() => {
       loading.value = false
       loadingProgress.value = 0
       loadingStatus.value = ''
+      cancelRequested.value = false
+      currentTaskId.value = null
     }, 1000)
   }
 }
@@ -829,6 +883,19 @@ const handleSubmit = async () => {
   color: #0958d9;
   font-size: 15px;
   font-weight: 650;
+}
+
+.cancel-button {
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cancel-hint {
+  margin: 10px 0 0;
+  color: #d46b08;
+  font-size: 13px;
 }
 
 @media (max-width: 960px) {

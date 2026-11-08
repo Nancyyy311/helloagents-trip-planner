@@ -65,6 +65,14 @@ export type PlanTaskStatus = 'pending' | 'running' | 'canceling' | 'done' | 'fai
 export interface GenerateTripPlanOptions {
   /** 任务状态变化回调，用来把"排队中/生成中"如实显示给用户 */
   onStatus?: (status: PlanTaskStatus) => void
+  /**
+   * 任务提交成功后回调 task_id。
+   *
+   * 为什么需要它：`pagehide` 只能在"关页面"时取消，用户在生成过程中想主动
+   * 放弃（换个城市重来），页面还开着，就必须拿到 task_id 才能发 DELETE。
+   * 不暴露这个 id，后端的取消接口就永远只能被"关闭页面"这一个场景触发。
+   */
+  onSubmitted?: (taskId: string) => void
 }
 
 const POLL_INTERVAL_MS = 1200
@@ -111,6 +119,7 @@ export async function generateTripPlan(
     const submitted = await apiClient.post<{ task_id: string }>('/api/trip/plan/async', formData)
     taskId = submitted.data.task_id
     inFlightTaskId = taskId
+    options.onSubmitted?.(taskId)
   } catch (error: any) {
     throw new Error(error.response?.data?.detail || error.message || '提交生成任务失败')
   }
