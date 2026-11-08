@@ -225,6 +225,14 @@ class TripPlan(BaseModel):
     overall_suggestions: str = Field(..., description="总体建议")
     budget: Optional[Budget] = Field(default=None, description="预算信息")
     grounding: Optional[GroundingSummary] = Field(default=None, description="POI真实性校验摘要")
+    # 改造点：留存模型"自己说"的预算总额，归一化前写入。
+    # 没有它，"代码纠正了多少钱"就无法离线度量——因为 budget.total 已被覆盖，
+    # 拿它和重算值比是恒真命题（同义反复），不能当效果证据。
+    # None 表示模型上报值与重算值一致（或未触发归一化），不参与展示。
+    budget_reported_raw: Optional[int] = Field(
+        default=None,
+        description="模型原始上报的预算总额（归一化前），仅用于审计与评测",
+    )
 
 
 class TripPlanResponse(BaseModel):

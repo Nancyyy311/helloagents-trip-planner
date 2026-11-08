@@ -170,9 +170,29 @@ def evaluate_plan(
     reported_total = int((trip_plan.budget.total if trip_plan.budget else 0) or 0)
     # 上报预算和按 POI 单价重算的预算必须对得上。"对不上"通常意味着
     # 模型把房间数/人数乘错了——这是最容易被用户当场发现的那种错。
+    #
+    # 注意：归一化上线后 budget.total 已经是重算值，这里必然相等。
+    # 所以这个字段只能当"接线检查"（证明归一化真的挂上了），
+    # 不能当"模型准确率提升"的证据。真正的效果证据看下面 normalized_* 与
+    # hidden_overrun——它们依赖 budget_reported_raw（模型原始值）。
     report_consistent = abs(reported_total - budget_total) <= max(
         1, int(budget_total * BUDGET_REPORT_TOLERANCE)
     )
+    # 模型原始上报值。旧数据没有这个字段（当时未留存），退化为"未干预"，
+    # 同时用 raw_available 标出来，避免把"没记录"误读成"没纠正"。
+    reported_raw = trip_plan.budget_reported_raw
+    raw_available = reported_raw is not None
+    raw_baseline = reported_raw if raw_available else reported_total
+    normalized = raw_available and abs(raw_baseline - reported_total) > 0
+    normalized_delta = (reported_total - raw_baseline) if normalized else 0
+    # 修复前的隐性超支：模型上报"没超预算"，实际按单价算超了。
+    # 这是用户会当场失信的那类错（到店才发现钱不够），比"偏差金额"更该报。
+    hidden_overrun = (
+        raw_available
+        and target > 0
+        and raw_baseline <= target < budget_total
+    )
+    hidden_overrun_amount = (budget_total - target) if hidden_overrun else 0
     deviation: Optional[float] = None
     budget_over = False
     if target > 0:
@@ -211,6 +231,12 @@ def evaluate_plan(
             "reported_total": reported_total,
             "recomputed_total": budget_total,
             "report_consistent": report_consistent,
+            "reported_raw": reported_raw,
+            "raw_available": raw_available,
+            "normalized": normalized,
+            "normalized_delta": normalized_delta,
+            "hidden_overrun": hidden_overrun,
+            "hidden_overrun_amount": hidden_overrun_amount,
             "deviation": deviation,
             "over_tolerance": over_tolerance,
             "over": budget_over,
@@ -250,6 +276,14 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     report_consistent_cases = sum(
         1 for item in results if item["budget"].get("report_consistent")
     )
+    budget_cases = [item["budget"] for item in results]
+    raw_available_cases = sum(1 for b in budget_cases if b.get("raw_available"))
+    normalized_cases = sum(1 for b in budget_cases if b.get("normalized"))
+    normalized_amount = sum(abs(int(b.get("normalized_delta") or 0)) for b in budget_cases)
+    hidden_overrun_cases = sum(1 for b in budget_cases if b.get("hidden_overrun"))
+    hidden_overrun_max = max(
+        [int(b.get("hidden_overrun_amount") or 0) for b in budget_cases] or [0]
+    )
 
     return {
         "cases": len(results),
@@ -259,6 +293,13 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "grounding_mean": round(sum(grounding_rates) / len(grounding_rates), 4),
         "grounding_ok_rate": _rate([bool(item["grounding_ok"]) for item in results]),
         "budget_report_consistent_rate": round(report_consistent_cases / len(results), 4),
+        # 下面四项依赖 budget_reported_raw，是"代码纠正了多少"的可信度量。
+        # 旧数据没有原始值，raw_available_cases 会提醒读者：这一批度量不到。
+        "budget_raw_available_cases": raw_available_cases,
+        "budget_normalized_cases": normalized_cases,
+        "budget_normalized_amount": normalized_amount,
+        "budget_hidden_overrun_cases": hidden_overrun_cases,
+        "budget_hidden_overrun_max": hidden_overrun_max,
         "budget_over_rate": round(over_count / len(results), 4),
         "budget_deviation_median": round(median(deviations), 4) if deviations else None,
         "budget_deviation_mean": round(sum(deviations) / len(deviations), 4) if deviations else None,
@@ -266,6 +307,30 @@ def aggregate(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "constraint_violation_total": violation_total,
         "duplicate_case_rate": round(duplicate_cases / len(results), 4),
     }
+
+
+def _budget_audit_line(summary: Dict[str, Any]) -> str:
+    """预算纠正审计的一行摘要。
+
+    为什么单独一行：`budget_report_consistent_rate` 在归一化上线后恒为 100%，
+    它只能证明归一化挂上了。真正说明"代码纠正了多少"的是下面这行。
+    旧数据没有 budget_reported_raw，必须显式说"度量不到"，不能默认成 0。
+    """
+    cases = int(summary.get("cases") or 0)
+    raw_available = int(summary.get("budget_raw_available_cases") or 0)
+    if raw_available == 0:
+        return (
+            "- 预算纠正审计：**本批数据未记录模型原始上报值**（旧格式），"
+            "无法度量纠正量；需重跑一次或使用 `scripts/audit_budget.py`"
+        )
+    normalized = int(summary.get("budget_normalized_cases") or 0)
+    amount = int(summary.get("budget_normalized_amount") or 0)
+    hidden = int(summary.get("budget_hidden_overrun_cases") or 0)
+    hidden_max = int(summary.get("budget_hidden_overrun_max") or 0)
+    return (
+        f"- 预算纠正审计：**{normalized}/{cases}** 份被代码纠正，累计金额差 **{amount} 元**；"
+        f"其中修复前隐藏超支 **{hidden}** 份（最大 **{hidden_max} 元**）"
+    )
 
 
 def render_markdown(summary: Dict[str, Any], results: Sequence[Dict[str, Any]], title: str = "评测报告") -> str:
@@ -280,7 +345,8 @@ def render_markdown(summary: Dict[str, Any], results: Sequence[Dict[str, Any]], 
         f"- 预算超支率：**{summary.get('budget_over_rate', 0):.1%}**"
         f"（偏差中位数 {_fmt_pct(summary.get('budget_deviation_median'))}）",
         f"- 预算上报一致率：**{summary.get('budget_report_consistent_rate', 0):.1%}**"
-        "（上报总额 vs 按单价重算）",
+        "（上报总额 vs 按单价重算；归一化上线后此值恒真，只作接线检查）",
+        _budget_audit_line(summary),
         f"- 约束违反：**{summary.get('constraint_violation_case_rate', 0):.1%}** 的用例"
         f"（共 {summary.get('constraint_violation_total', 0)} 条）",
         f"- 景点跨天重复：**{summary.get('duplicate_case_rate', 0):.1%}** 的用例",

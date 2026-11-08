@@ -911,9 +911,13 @@ class MultiAgentTripPlanner:
                 verify_trip_plan(trip_plan, planner_context)
                 metrics.record_grounding(trip_plan.grounding)
                 # 改造点：预算总额不再采信模型的自报数，按 POI 单价重算覆盖。
-                # 实测 18 条里 11 条对不上账（房间数乘错），属于用户一眼能发现的错。
+                # 基线实测：18 份计划里 12 份账实不符（累计偏差 5631 元，
+                # 最大少报 20%），其中 2 份把超支藏在预算内——用户到店才会发现。
                 budget_note = normalize_budget(trip_plan, request)
                 if budget_note["changed"]:
+                    # 留存模型原始值：budget.total 已被覆盖，不记下来就再也算不出
+                    # "改了多少份、多少钱"，而拿覆盖后的值再比一次是恒真命题。
+                    trip_plan.budget_reported_raw = budget_note["before_total"]
                     print(describe_budget_fix(budget_note), flush=True)
             validate_trip_plan_shape(trip_plan, request, planner_context)
 
