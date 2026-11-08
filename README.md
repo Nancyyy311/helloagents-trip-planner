@@ -1,3 +1,13 @@
+> **本仓库是 [helloagents-trip-planner](https://github.com/nameless0120/helloagents-trip-planner) 的二次开发版本**（原作者 nameless0120，遵循 CC BY-NC-SA 4.0）。
+> 改造目标：把"能演示的 demo"变成"能上线的服务"——输出可信性治理、事件循环阻塞修复、评测驱动迭代。
+>
+> **改造内容、逐项实测数据、已知短板（12 条）见 [README_改造说明.md](README_改造说明.md)。**
+>
+> ```
+> cd backend  && pytest -q      # 216 passed，全部离线 monkeypatch，不烧额度，约 7 秒
+> cd frontend && npm test       # 28 passed（vitest），253 毫秒
+> ```
+
 # HelloAgents Trip Planner
 
 一个面向真实旅行规划场景的智能旅行助手。仓库里有可运行的 Web 应用、FastAPI 后端、基于高德地图的结构化工具快照，也保留了后训练数据和评测口径。
