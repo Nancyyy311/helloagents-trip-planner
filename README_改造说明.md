@@ -78,7 +78,7 @@
 | SSE 流式推送 | `GET /plan/async/{id}/stream`，状态一变就推，15s 心跳，600s 超时，`X-Accel-Buffering: no` | 一次连接拿到底，省掉轮询空转 |
 | JSON 解析鲁棒性 | 支持前后说明文字、代码块、尾逗号、中文引号、BOM、**截断补全**；仍失败才抛错 | 直接消掉一大批"解析失败 → 重跑 40s" |
 | 弃用 API 清理 | `@app.on_event` → `lifespan`；`Field(example=)` → `json_schema_extra`；`class Config` → `model_config` | 弃用警告 **27 → 1**（剩下 1 个在第三方库） |
-| 回归测试 | `pytest` **65 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
+| 回归测试 | `pytest` **92 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
 
 ### 维度 E · 真 Agent（把"伪工具调用"补成真调用）
 
@@ -208,6 +208,39 @@ D2: [八大关, 奥帆中心, 情人坝] → [八大关, 海军博物馆, 奥帆
 > `grounding_checked=20` 但 `coordinates_corrected=3`，说明"名字对、坐标错"是最隐蔽的幻觉形态；
 > `repaired=1` 说明有一次候选是**靠解析修复救回来的**，否则要重跑 40 秒。
 
+### 4.6 推理模式与输出截断（根因排查）
+
+**现象**：候选有效数长期只有 2/3，失败日志里 8 成是"响应中未找到完整的顶层TripPlan JSON对象"。
+
+**排查顺序**（先看数据，再改代码）：
+
+1. `backend/scripts/analyze_failures.py` 统计历史 38 条失败：25 条原文为空（早期并行路径丢原文的回归），13 条有原文的里 **12 条结尾停在半句话或半个数字上**（如 `"longitude": 116`），只有 1 条是真的结构错误；
+2. 对照 `max_tokens`：同样 3 天行程、同样 8400 上限，截断位置从 480 字符到 6156 字符不等 —— 若真是额度用满，长度应该稳定，说明有别的东西在抢预算；
+3. 一次最小真实调用把原始 response 打出来：`completion_tokens=16` 而内容只有两个字，`reasoning_tokens=14`，字段里有 `reasoning_content`；
+4. 查 DeepSeek 官方文档确认三条：思考模式**默认开启**、推理 token **计入** `completion_tokens` 且**占用** `max_tokens`、**思考模式下 `temperature` 无效**。
+
+**结论**：`deepseek-v4-flash` 默认开思考，3 天行程单候选平均要 **9739 token**，而预算是 **8400** —— 每个候选都注定被切断。
+
+**A/B 实测**（同一请求，北京 3 天，3 候选）：
+
+| 指标 | 开启思考（默认） | 关闭思考（现配置） |
+|---|---|---|
+| 端到端耗时 | 81.72 s | **14.95 s** |
+| completion tokens | 29 216 | 7 715 |
+| 其中推理 tokens | 21 699（**74.3%**） | **0** |
+| `candidate_valid` | 3/3 | **3/3** |
+| `grounding_rate` | 1.0 | 1.0 |
+| 景点 / 餐饮 | 8 / 9 | 8 / 9 |
+
+结构完全一致，差别只在文案长度（332 字 vs 124 字）——**思考买到的是更啰嗦的描述，不是更好的安排，代价是 5.5 倍时间**。
+
+**代码上的处理**：
+
+- `app/agents/llm_tracing.py`：`TracedLLM` 子类补记 `finish_reason` / `usage` / `reasoning_tokens`。不改 `venv` 里的第三方库（升级即丢），元信息存 `threading.local`（3 路候选并行共用一个客户端）。
+- `PLANNER_THINKING`（默认 0）：关闭思考。若开启，`planner_max_output_tokens()` 会自动追加 8000 推理预留，避免一开就撞上同一堵墙。
+- `app/planner/failure_kind.py`：把失败分成 `truncated_in_string` / `truncated_in_number` / `truncated_structure` / `trailing_content` / `schema_invalid` 等 8 类，进 `/metrics` 的 `planner_failures_by_kind`，让下次优化有方向而不是靠猜。
+- 注意：关思考同时让 `temperature` 恢复生效。本项目靠 `0.2 / 0.28 / 0.36` 的温度阶梯制造候选差异，而思考模式下这个参数是被 API 忽略的——也就是说候选多样性策略在改造前一直没真正起作用。
+
 ---
 
 ## 5. 接口一览
@@ -283,7 +316,7 @@ curl -X POST http://localhost:7000/api/trip/plan/<plan_id>/refine \
 
 | 层次 | 做法 | 说明 |
 |---|---|---|
-| 单元/接口测试 | `pytest` **65 个用例**，`TestClient` + `monkeypatch` | 全部不烧额度，秒级完成，可随时跑 |
+| 单元/接口测试 | `pytest` **92 个用例**，`TestClient` + `monkeypatch` | 全部不烧额度，秒级完成，可随时跑 |
 | 真实链路验证 | 手工打真实请求（DeepSeek + 高德），记录耗时与指标 | 单元测试不验证模型行为，真实行为必须实测 |
 | 覆盖重点 | 解析鲁棒性（11）、Grounding（12）、增量修改（8）、缓存与退避（10）、工具预算（16）、错误语义（3+） | 优先覆盖"改动过的地方"和"出错代价高的地方" |
 
