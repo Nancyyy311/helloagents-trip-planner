@@ -347,6 +347,53 @@ DELETE /api/trip/plan/async/{task_id}  → pagehide 时用 fetch+keepalive 发�
 `degraded` 仍然返回 200 是刻意的：缺高德 Key 只是拿不到真实 POI，计划还能出，
 这时候摘流量是自伤。真正该 503 的只有"没有 LLM Key"。
 
+### 4.11 取消能力只做了一半（批次10）
+
+批次9 做完之后做了一次全面核查，发现三个断点——**能力在，用户用不上**。
+
+**断点1：前端没有取消按钮。** `api.ts` 里写了 `cancelPlanTask()`，`Home.vue` 没导入它；
+加载弹窗里也没有按钮。用户想换个城市重来，只能等 15 秒或关掉整个页面。
+根因是没把 `task_id` 暴露给调用方——`pagehide` 能在关页面时取消，
+但用户主动放弃时页面还开着，拿不到 id 就无从下手。现在 `generateTripPlan`
+通过 `onSubmitted(taskId)` 把 id 交出去。
+
+**断点2：refine 完全不能取消。** `_refine_isolated` 早就支持 `cancel_token`，
+但端点调用时**没传**。同一个项目里"生成能取消、改一句话不能取消"。
+现在用 `plan_id` 做取消键（`_claim_plan` 已保证同一 plan 同时只有一轮 refine，
+不需要再造一套 id），新增 `DELETE /api/trip/plan/{plan_id}/refine`。
+
+**断点3：refine 的 LLM 返回后没有检查点。** `_call_llm_with_backoff` 只在
+**发请求之前**检查；请求在飞时取消，跑完直接返回 200 —— 用户点了取消，
+却收到一份"只改了一半"的计划。实测证据：
+
+```
+# 修复前
+DELETE -> 200 cancel=canceling token={'cancelled': True, 'stage': 'before_llm:增量修改'}
+refine 返回: 200        ← 假成功
+tasks_canceled: 0       ← 取消根本没被记上
+
+# 修复后（加了 after_refine_llm 检查点）
+refine 返回: 499
+tasks_canceled: 1  by_stage={'after_refine_llm': 1}
+```
+
+只有 8 行，但这是"取消到底有没有用"的分水岭。已经花掉的那次调用收不回来
+（Python 没有线程 kill），但结果不该被当成成功交付。
+
+### 4.12 限流分档第二次踩坑（批次10）
+
+实测 refine 取消时先撞了 429，原因和 4.9 是同一类错误的第二次：
+
+1. `DELETE /plan/{id}/refine` 被路径前缀判成 **plan 档**（扣 2 令牌），
+   可它零 LLM 成本；
+2. 「生成一次（扣 2）+ 改一句（扣 2）」= 4 > `plan_burst=3`，正常流程第二步就死。
+
+改法：扣费对齐真实成本。首次生成 3 候选扣 2，增量修改单次调用扣 1，
+取消走 poll 档。`plan_burst` 3 → 4（一次自然会话 = 生成 2 + 改两句 1+1 = 4）。
+
+> 教训重复了一次，值得记下来：**限流必须按"会不会触发 LLM"分档，
+> 不能按路径前缀分档。** 每次新增路由都要问一遍这句话。
+
 ---
 
 ## 5. 接口一览
@@ -359,6 +406,7 @@ DELETE /api/trip/plan/async/{task_id}  → pagehide 时用 fetch+keepalive 发�
 | GET | `/api/trip/plan/async/{task_id}/stream` | **SSE 推送**任务进度与结果 |
 | DELETE | `/api/trip/plan/async/{task_id}` | **取消任务**：pending 立即 canceled，running 0.4s 内停下 |
 | POST | `/api/trip/plan/{plan_id}/refine` | **增量修改**：改一句话，返回新计划 + 变更摘要 |
+| DELETE | `/api/trip/plan/{plan_id}/refine` | **取消增量修改**：原计划不受影响；没有在跑时 409 |
 | GET | `/api/trip/health` | 旅行规划子服务健康检查 |
 | GET | `/health` | 应用健康检查 |
 | GET | `/healthz` | **存活探针**（永远 200，不检查依赖） |
@@ -366,15 +414,16 @@ DELETE /api/trip/plan/async/{task_id}  → pagehide 时用 fetch+keepalive 发�
 | GET | `/metrics` | 指标快照（含限流/并发/合并/取消计数） |
 | GET | `/docs` · `/redoc` | OpenAPI 文档 |
 
-行程相关端点：**2 → 6 个**。
+行程相关端点：**2 → 7 个**。
 
 失败语义（全部有据可查，不再一律 500）：
 
 | 状态码 | 含义 |
 |---|---|
 | 429 | 触发限流，带 `Retry-After` |
+| 499 | 客户端主动取消（Nginx 的 "Client Closed Request"）；**原计划未受影响** |
 | 503 | 并发规划已满（`PLANNER_MAX_CONCURRENCY`），带 `Retry-After` |
-| 409 | 该计划正在被另一轮修改占用；或试图取消一个已经结束的任务（结果已经在那儿了，不假装成功） |
+| 409 | 该计划正在被另一轮修改占用；试图取消一个已结束/未在跑的任务（结果已经在那儿了，不假装成功） |
 | 502 | LLM 失败走了 fallback（返回降级计划 + `success=false`）或增量修改失败（原计划未受影响） |
 
 ---
