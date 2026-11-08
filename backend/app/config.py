@@ -51,6 +51,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AMAP_API_KEY", "AMAP_MAPS_API_KEY"),
     )
 
+    # 批次11：Unsplash 搜索 API 已弃用（国内不可达 + async 路由阻塞事件循环），
+    # 图片改为本地映射表 + 磁盘缓存代理，见 app/planner/local_photo_table.py。
+    # 字段保留仅为兼容旧 .env，不再被任何代码读取。
     unsplash_access_key: str = ""
     unsplash_secret_key: str = ""
 

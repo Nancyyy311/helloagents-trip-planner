@@ -45,6 +45,9 @@ ENV/
 .coverage
 htmlcov/
 
+# 批次11：景点图片磁盘缓存（运行时生成，不入库）
+.cache/
+
 # 操作系统
 .DS_Store
 Thumbs.db
