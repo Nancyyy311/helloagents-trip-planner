@@ -320,6 +320,9 @@
         </a-card>
 
         <a-card id="weather" v-if="tripPlan.weather_info && tripPlan.weather_info.length > 0" title="天气信息" style="margin-top: 20px" :bordered="false">
+        <p v-if="hasUnknownWeather(tripPlan.weather_info)" class="weather-hint">
+          高德预报只覆盖未来 4 天，超出的日期显示为“远期天气暂无准确预报”，不会编造温度。
+        </p>
         <a-list
           :data-source="tripPlan.weather_info"
           :grid="{ gutter: 16, column: 3 }"
@@ -332,18 +335,18 @@
                   <span class="weather-icon">{{ getWeatherIcon(item.day_weather, 'day') }}</span>
                   <div>
                     <div class="weather-label">白天</div>
-                    <div class="weather-value">{{ item.day_weather }} {{ item.day_temp }}°C</div>
+                    <div class="weather-value">{{ item.day_weather }} {{ formatTemperature(item.day_temp) }}</div>
                   </div>
                 </div>
                 <div class="weather-info-row">
                   <span class="weather-icon">{{ getWeatherIcon(item.night_weather, 'night') }}</span>
                   <div>
                     <div class="weather-label">夜间</div>
-                    <div class="weather-value">{{ item.night_weather }} {{ item.night_temp }}°C</div>
+                    <div class="weather-value">{{ item.night_weather }} {{ formatTemperature(item.night_temp) }}</div>
                   </div>
                 </div>
-                <div class="weather-wind">
-                  💨 {{ item.wind_direction }} {{ item.wind_power }}
+                <div v-if="formatWind(item.wind_direction, item.wind_power)" class="weather-wind">
+                  💨 {{ formatWind(item.wind_direction, item.wind_power) }}
                 </div>
               </a-card>
             </a-list-item>
@@ -400,9 +403,12 @@ import { API_BASE_URL } from '@/services/api'
 import {
   buildAttractionPlaceholder,
   canRemoveAttraction,
+  formatTemperature,
+  formatWind,
   getMealLabel,
   getWeatherCardClass,
   getWeatherIcon,
+  hasUnknownWeather,
   isLodgingBreakfastMeal,
   moveInList
 } from '@/utils/planView'
@@ -1469,6 +1475,16 @@ const destroyMaps = () => {
 .weather-card:hover {
   transform: translateY(-4px);
   box-shadow: 0 10px 20px rgba(15, 23, 42, 0.1);
+}
+
+.weather-hint {
+  margin: -4px 0 16px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .weather-date {

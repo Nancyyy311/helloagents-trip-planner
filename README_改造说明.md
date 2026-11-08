@@ -78,7 +78,7 @@
 | SSE 流式推送 | `GET /plan/async/{id}/stream`，状态一变就推，15s 心跳，600s 超时，`X-Accel-Buffering: no` | 一次连接拿到底，省掉轮询空转 |
 | JSON 解析鲁棒性 | 支持前后说明文字、代码块、尾逗号、中文引号、BOM、**截断补全**；仍失败才抛错 | 直接消掉一大批"解析失败 → 重跑 40s" |
 | 弃用 API 清理 | `@app.on_event` → `lifespan`；`Field(example=)` → `json_schema_extra`；`class Config` → `model_config` | 弃用警告 **27 → 1**（剩下 1 个在第三方库） |
-| 回归测试 | `pytest` **216 个用例** + 前端 `vitest` **33 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
+| 回归测试 | `pytest` **223 个用例** + 前端 `vitest` **43 个用例**，用 `monkeypatch` 替换真实 LLM / 高德，**不烧额度**、秒级跑完 | 改动有保护 |
 
 ### 维度 E · 真 Agent（把"伪工具调用"补成真调用）
 
@@ -633,7 +633,7 @@ curl -X POST http://localhost:7000/api/trip/plan/<plan_id>/refine \
 
 | 层次 | 做法 | 说明 |
 |---|---|---|
-| 后端单元/接口 | `pytest` **216 个用例**，`TestClient` + `monkeypatch` | 全部不烧额度，约 7 秒跑完，可随时回归 |
+| 后端单元/接口 | `pytest` **223 个用例**，`TestClient` + `monkeypatch` | 全部不烧额度，约 7 秒跑完，可随时回归 |
 | 前端纯逻辑 | `vitest` **28 个用例**（`npm test`），只测从组件里抽出的纯函数 | 253ms，不需要浏览器；覆盖天气判断顺序、占位图索引边界、景点移动越界 |
 | 前端组件 | `vitest` + `jsdom` + `@vue/test-utils` **5 个用例**，真挂载 `GeneratingPanel` | 断言取消按钮确实渲染、是实心主按钮而非文字按钮、点击真的抛事件；用户曾反馈「页面上看不到取消入口」，读代码证明不了这件事 |
 | 真实链路验证 | 手工打真实请求（DeepSeek + 高德），记录耗时与指标 | 单元测试不验证模型行为，真实行为必须实测 |

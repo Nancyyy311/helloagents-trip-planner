@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   buildAttractionPlaceholder,
   canRemoveAttraction,
+  formatTemperature,
+  formatWind,
   getMealLabel,
   getWeatherCardClass,
   getWeatherIcon,
+  hasUnknownWeather,
   isLodgingBreakfastMeal,
   moveInList
 } from '../planView'
@@ -74,6 +77,70 @@ describe('getWeatherCardClass', () => {
   it('两段都缺失时走 unknown，而不是当成晴天', () => {
     expect(getWeatherCardClass(null, undefined)).toBe('weather-card-unknown')
     expect(getWeatherCardClass('暂无', '未知')).toBe('weather-card-unknown')
+  })
+})
+
+describe('formatTemperature', () => {
+  it('数字加 °C', () => {
+    expect(formatTemperature(18)).toBe('18°C')
+    expect(formatTemperature(0)).toBe('0°C')
+    expect(formatTemperature(-5)).toBe('-5°C')
+  })
+
+  it('字符串数字也认，避免高德把温度返回成字符串时丢掉单位', () => {
+    expect(formatTemperature('18')).toBe('18°C')
+    expect(formatTemperature(' -3 ')).toBe('-3°C')
+  })
+
+  it('未知/null/空 一律显示破折号，不能出现"未知°C"', () => {
+    // 这是结果页真实出现过的问题：远期天气温度是"未知"，模板却硬拼 °C
+    expect(formatTemperature('未知')).toBe('—')
+    expect(formatTemperature('暂无')).toBe('—')
+    expect(formatTemperature(null)).toBe('—')
+    expect(formatTemperature(undefined)).toBe('—')
+    expect(formatTemperature('')).toBe('—')
+    expect(formatTemperature(Number.NaN)).toBe('—')
+    expect(formatTemperature('未知')).not.toContain('°C')
+  })
+
+  it('其他无法解析的文案原样返回，不吞掉信息', () => {
+    expect(formatTemperature('N/A')).toBe('N/A')
+  })
+})
+
+describe('formatWind', () => {
+  it('风向和风力都有效时拼一段', () => {
+    expect(formatWind('东南', '1-3级')).toBe('东南 1-3级')
+  })
+
+  it('只有一半有效时只显示那一半', () => {
+    expect(formatWind('东南', '未知')).toBe('东南')
+    expect(formatWind('未知', '3-4级')).toBe('3-4级')
+  })
+
+  it('两段都未知时返回空串，模板据此整行不渲染', () => {
+    expect(formatWind('未知', '未知')).toBe('')
+    expect(formatWind(null, undefined)).toBe('')
+  })
+})
+
+describe('hasUnknownWeather', () => {
+  it('有远期占位时返回 true，用于在天气区顶部解释原因', () => {
+    expect(hasUnknownWeather([
+      { day_weather: '阴' },
+      { day_weather: '远期天气暂无准确预报' }
+    ])).toBe(true)
+  })
+
+  it('全是真实预报时返回 false，不要无病呻吟', () => {
+    expect(hasUnknownWeather([{ day_weather: '阴' }, { day_weather: '晴' }])).toBe(false)
+  })
+
+  it('空值/非数组不抛错', () => {
+    expect(hasUnknownWeather([])).toBe(false)
+    expect(hasUnknownWeather(null)).toBe(false)
+    expect(hasUnknownWeather(undefined)).toBe(false)
+    expect(hasUnknownWeather([{}, null])).toBe(false)
   })
 })
 

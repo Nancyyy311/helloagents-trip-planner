@@ -60,8 +60,9 @@ export interface WeatherInfo {
   date: string
   day_weather: string
   night_weather: string
-  day_temp: number
-  night_temp: number
+  // 远期天气拿不到温度时后端返回字符串 "未知"，不是只有数字
+  day_temp: number | string
+  night_temp: number | string
   wind_direction: string
   wind_power: string
 }

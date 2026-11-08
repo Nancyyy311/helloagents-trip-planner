@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,8 +35,39 @@ PLANNER_CONTEXT_CACHE_VERBOSE = os.getenv("PLANNER_CONTEXT_CACHE_VERBOSE", "0") 
 AMAP_QPS_LIMIT = float(os.getenv("AMAP_QPS_LIMIT", "3"))
 AMAP_MIN_INTERVAL_SECONDS = 1.0 / AMAP_QPS_LIMIT if AMAP_QPS_LIMIT > 0 else 0.0
 
+# 天气缓存单独治理：天气预报是"按天滚动"的，不是"按 TTL 过期"的。
+# 复用 PLANNER_CONTEXT_CACHE_TTL_SECONDS（默认 24 小时，线上曾有 60 天的配置）
+# 会出现：昨天 23:42 缓存了 11-08~11-11 的预报，今天 11-09 规划 11-11~11-15 时，
+# 直接用昨天的预报，导致只有 11-11 一天有天气、后面 4 天全"远期天气暂无准确预报"。
+# 规则改成：TTL 只兜"当天内的重复请求"，跨天必须重新拉——由 casts[0].date == 今天 判定。
+AMAP_WEATHER_PATH = "/weather/weatherInfo"
+AMAP_WEATHER_CACHE_TTL_SECONDS = int(os.getenv("AMAP_WEATHER_CACHE_TTL_SECONDS", str(60 * 60)))
+
 _AMAP_RATE_LIMIT_LOCK = threading.Lock()
 _AMAP_LAST_REQUEST_AT = 0.0
+
+
+def weather_forecast_dates(payload: Optional[Dict[str, Any]]) -> List[str]:
+    """取出高德天气预报覆盖的日期列表（按接口返回顺序）。"""
+    forecasts = (payload or {}).get("forecasts") or []
+    if not forecasts:
+        return []
+    casts = (forecasts[0] or {}).get("casts") or []
+    return [str((cast or {}).get("date") or "") for cast in casts if (cast or {}).get("date")]
+
+
+def weather_window_starts_today(payload: Optional[Dict[str, Any]], today: Optional[date] = None) -> bool:
+    """判断一份天气预报是否"今天拉的"：高德的 casts[0] 永远是当天。
+
+    这是天气缓存的新鲜度判据，比 TTL 更准——按 TTL 存 24 小时的话，
+    昨天 23:42 的预报今天仍然"没过期"，但它只覆盖到 11-11，
+    规划 11-11~11-15 时后面几天就只能写"远期天气暂无准确预报"。
+    空结果（城市解析失败等）不走这个判据，交给短 TTL 兜住，避免每次请求都打接口。
+    """
+    dates = weather_forecast_dates(payload)
+    if not dates:
+        return True
+    return dates[0] == (today or date.today()).isoformat()
 
 
 def set_amap_qps_limit(qps_limit: float) -> None:
@@ -64,15 +96,19 @@ class AmapPlannerClient:
 
         query_params = {key: value for key, value in params.items() if value not in (None, "")}
         cache_path = self._amap_cache_path(path, query_params)
+        ttl_seconds = self._ttl_seconds_for(path)
         cached = self._read_cache(
             cache_path,
             value_key="data",
-            ttl_seconds=PLANNER_CONTEXT_AMAP_CACHE_TTL_SECONDS,
+            ttl_seconds=ttl_seconds,
         )
-        if cached is not None:
+        if cached is not None and self._cache_still_current(path, cached):
             if PLANNER_CONTEXT_CACHE_VERBOSE:
                 print(f"  - amap缓存命中: {path} {self._cache_label(query_params)}")
             return cached
+        if cached is not None:
+            # 没过 TTL 但预报窗口已过期（跨天），按未命中处理，往下重新请求
+            cached = None
 
         request_params = {**query_params, "key": self.api_key}
         last_exc: Optional[Exception] = None
@@ -88,7 +124,7 @@ class AmapPlannerClient:
                     cache_path,
                     data,
                     value_key="data",
-                    ttl_seconds=PLANNER_CONTEXT_AMAP_CACHE_TTL_SECONDS,
+                    ttl_seconds=ttl_seconds,
                     label="amap",
                 )
                 return data
@@ -96,6 +132,20 @@ class AmapPlannerClient:
                 last_exc = exc
                 time.sleep(0.5 + attempt)
         raise RuntimeError(f"高德API请求失败: {last_exc}") from last_exc
+
+    @staticmethod
+    def _is_weather_path(path: str) -> bool:
+        return path.rstrip("/").endswith(AMAP_WEATHER_PATH)
+
+    def _ttl_seconds_for(self, path: str) -> int:
+        """天气走短 TTL，其余接口沿用通用 TTL。"""
+        return AMAP_WEATHER_CACHE_TTL_SECONDS if self._is_weather_path(path) else PLANNER_CONTEXT_AMAP_CACHE_TTL_SECONDS
+
+    def _cache_still_current(self, path: str, payload: Dict[str, Any]) -> bool:
+        """TTL 之外再按业务语义判新鲜度：天气预报必须从"今天"开始。"""
+        if not self._is_weather_path(path):
+            return True
+        return weather_window_starts_today(payload)
 
     def search_keywords(
         self,

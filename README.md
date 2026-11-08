@@ -4,8 +4,8 @@
 > **改造内容、逐项实测数据、已知短板（12 条）见 [README_改造说明.md](README_改造说明.md)。**
 >
 > ```
-> cd backend  && pytest -q      # 216 passed，全部离线 monkeypatch，不烧额度，约 7 秒
-> cd frontend && npm test       # 28 passed（vitest），253 毫秒
+> cd backend  && pytest -q      # 223 passed，全部离线 monkeypatch，不烧额度，约 7 秒
+> cd frontend && npm test       # 43 passed（vitest），约 4 秒
 > ```
 
 # HelloAgents Trip Planner

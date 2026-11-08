@@ -62,6 +62,40 @@ export function getWeatherCardClass(dayWeather: unknown, nightWeather: unknown):
 }
 
 /**
+ * 行程里是否含"远期天气占位"。
+ * 高德预报只覆盖今天起 4 天，超出部分后端会显式写占位文案；
+ * 页面据此在天气区块顶部提示原因，避免用户以为是我们没查到。
+ */
+export function hasUnknownWeather(rows: unknown): boolean {
+  if (!Array.isArray(rows)) return false
+  return rows.some(row => {
+    const item = (row || {}) as Record<string, unknown>
+    return normalizeWeatherText(item.day_weather).includes('远期')
+  })
+}
+
+/**
+ * 温度展示：只有拿到真实数字才拼 °C。
+ * 远期天气后端会给 "未知"，原写法 `{{ day_temp }}°C` 会渲染成"未知°C"，
+ * 看起来像"温度是未知摄氏度"——比直接留空更误导。
+ */
+export function formatTemperature(value: unknown): string {
+  if (typeof value === 'number' && Number.isFinite(value)) return `${value}°C`
+  const text = normalizeWeatherText(value)
+  if (!text || text.includes('未知') || text.includes('暂无')) return '—'
+  if (/^-?\d+(\.\d+)?$/.test(text)) return `${text}°C`
+  return text
+}
+
+/** 风向风力："东南 1-3级"；两段都缺时返回空串，模板据此整行不渲染。 */
+export function formatWind(direction: unknown, power: unknown): string {
+  const dir = normalizeWeatherText(direction)
+  const pw = normalizeWeatherText(power)
+  const usable = (text: string) => !!text && !text.includes('未知') && !text.includes('暂无')
+  return [usable(dir) ? dir : '', usable(pw) ? pw : ''].filter(Boolean).join(' ')
+}
+
+/**
  * 判断某条早餐是否只是"住宿自带的早餐"。
  * 这类条目不值得去高德回填坐标（酒店本身已经有位置），
  * 原实现漏判会让结果页多发一批无谓的 POI 搜索请求。
