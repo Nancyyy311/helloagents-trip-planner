@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..config import get_settings, validate_config, print_config
 from ..planner.context import context_cache_stats
 from ..planner.output import output_parse_stats
+from .guard import RateLimitMiddleware, plan_gate, single_flight
 from .observability import RequestContextMiddleware, metrics
 from .routes import trip, poi, map as map_routes
 
@@ -65,6 +66,10 @@ app.add_middleware(
 )
 
 # 请求级 traceId + 内存指标（自研轻量版；生产可换 Prometheus / OpenTelemetry）
+# 顺序说明：先加的是内层。限流放在 RequestContext 内层，
+# 是为了让被 429 拦下的请求也能拿到 X-Request-ID 并计入耗时统计——
+# 否则"限流拦了多少"在请求日志里是查不到的。
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
 # 注册路由
@@ -103,6 +108,14 @@ async def metrics_endpoint():
     snapshot["planner_context_cache"] = context_cache_stats()
     # 解析失败看不见，但每次失败都要重跑一次几十秒的 LLM 调用，必须量化
     snapshot["planner_json_parse"] = output_parse_stats()
+    # 并发水位：当前有几个规划在跑、上限多少、拒了几个。
+    # 这是"服务是不是快被压垮"最直接的信号。
+    snapshot["planning_gate"] = plan_gate.snapshot()
+    # 请求合并：pending 表示正在飞行的去重 key 数
+    snapshot["single_flight"] = {
+        "pending": single_flight.pending(),
+        "joined": single_flight.joined,
+    }
     return snapshot
 
 

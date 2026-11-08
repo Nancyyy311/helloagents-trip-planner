@@ -55,6 +55,13 @@ class MetricsRegistry:
         # 只记"失败了几次"没用——截断要调输出预算，schema 不合法才该改 prompt，
         # 混在一起统计会一直把优化方向带偏。
         self.planner_failures_by_kind: dict[str, int] = defaultdict(int)
+        # 成本治理指标：限流拦了多少、并发拒绝多少、合并了多少请求。
+        # 这三个数不出现在面板上，就没人知道"钱是怎么被烧掉的"。
+        self.rate_limited_total = 0
+        self.rate_limited_by_tier: dict[str, int] = defaultdict(int)
+        self.planning_rejected = 0
+        self.coalesced_requests = 0
+        self.refine_conflicts = 0
         # Grounding 指标：模型编造了多少 POI / 坐标
         self.grounding_checked = 0
         self.grounding_verified = 0
@@ -133,6 +140,27 @@ class MetricsRegistry:
         """记录一次 Planner 解析失败的病因（见 planner/failure_kind.py）。"""
         with self._lock:
             self.planner_failures_by_kind[kind or "unknown"] += 1
+
+    def record_rate_limited(self, tier: str) -> None:
+        """记录一次被限流拦下的请求。这个数长期为 0 才正常。"""
+        with self._lock:
+            self.rate_limited_total += 1
+            self.rate_limited_by_tier[tier or "unknown"] += 1
+
+    def record_planning_rejected(self) -> None:
+        """记录一次因并发闸门已满被拒的规划请求。"""
+        with self._lock:
+            self.planning_rejected += 1
+
+    def record_coalesced(self) -> None:
+        """记录一次被合并的重复请求（省下的是真金白银的 LLM 调用）。"""
+        with self._lock:
+            self.coalesced_requests += 1
+
+    def record_refine_conflict(self) -> None:
+        """记录一次"同一计划并发修改"被拒。"""
+        with self._lock:
+            self.refine_conflicts += 1
 
     def record_grounding(self, summary) -> None:
         """记录一次 Grounding 校验结果（模型编造率）。
@@ -229,6 +257,13 @@ class MetricsRegistry:
                 "grounding_unverified": self.grounding_unverified,
                 "grounding_rate": round(grounding_rate, 4),
                 "grounding_coordinates_corrected": self.grounding_coordinates_corrected,
+                # 改造点：成本治理。原项目没有限额，谁都能把 LLM 额度刷光；
+                # 现在被拦住多少、合并掉多少，都是可以直接指着看的数字。
+                "rate_limited_total": self.rate_limited_total,
+                "rate_limited_by_tier": dict(self.rate_limited_by_tier),
+                "planning_rejected": self.planning_rejected,
+                "coalesced_requests": self.coalesced_requests,
+                "refine_conflicts": self.refine_conflicts,
             }
 
 

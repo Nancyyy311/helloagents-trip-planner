@@ -234,6 +234,12 @@ class TripPlanResponse(BaseModel):
     data: Optional[TripPlan] = Field(default=None, description="旅行计划数据")
     # 改造点：返回 plan_id，前端才能拿着它做"增量修改"（改一句话不用整趟重生成）
     plan_id: Optional[str] = Field(default=None, description="计划ID，用于后续增量修改")
+    # 改造点：告诉调用方这份结果是不是复用了别的在飞请求。
+    # 前端可以据此提示"已有相同请求在生成"，也方便演示时证明合并真的生效。
+    coalesced: bool = Field(
+        default=False,
+        description="是否复用了另一个相同请求的结果（请求合并命中）",
+    )
 
 
 class RefineRequest(BaseModel):

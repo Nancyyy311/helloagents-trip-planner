@@ -1,6 +1,7 @@
 """旅行规划API路由"""
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -22,6 +23,8 @@ from ...agents.trip_planner_agent import (
     MultiAgentTripPlanner,
     get_trip_planner_agent,
 )
+from ..guard import PlanningBusy, plan_gate, single_flight
+from ..observability import metrics
 
 router = APIRouter(prefix="/trip", tags=["旅行规划"])
 
@@ -57,6 +60,22 @@ _plans_lock = threading.Lock()
 _PLAN_TTL_SECONDS = 3600
 _PLAN_MAXSIZE = 200
 
+# 合并等待上限：leader 自己的 LLM 预算就是 600 秒，等待方稍宽一点即可。
+# 没有这个上限的话，leader 万一卡死在第三方 SDK 里，等待方会一起挂到天荒地老。
+_COALESCE_WAIT_SECONDS = 620.0
+
+
+def _plan_request_key(request: TripRequest) -> str:
+    """把请求压成去重指纹。
+
+    用完整字段的规范化 JSON 而不是只看城市+天数：偏好、预算、同行人
+    任意一项不同，生成结果就该不同，不能合并。
+    """
+    payload = json.dumps(
+        request.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
 
 # === 改造点：长任务异步化 ===
 # 生成一次要几十秒，同步等待会超时/占连接。这里提供异步任务：
@@ -65,6 +84,9 @@ _PLAN_MAXSIZE = 200
 _tasks: dict[str, dict] = {}
 _tasks_lock = threading.Lock()
 _TASK_TTL_SECONDS = 3600
+# 和计划表一样要有容量上限：一个任务里存着完整计划 JSON（几十 KB），
+# 只有 TTL 的话，一小时内提交多少就堆多少，进程内存只涨不落。
+_TASK_MAXSIZE = 200
 
 # SSE 推送参数：1 秒检查一次状态，15 秒发一次心跳，最多等 10 分钟
 _SSE_POLL_INTERVAL = 1.0
@@ -86,15 +108,32 @@ def _sse_frame(payload: dict, event: str | None = None) -> str:
 
 
 def _prune_tasks_locked() -> None:
-    """清理过期任务，避免内存无限增长（需在持锁状态下调用）。"""
+    """清理过期任务，避免内存无限增长（需在持锁状态下调用）。
+
+    两条约束缺一不可：
+    1. 过期就删（TTL）；
+    2. **正在跑的任务不能删**。删了用户就查不到结果，可钱已经花掉了。
+    容量淘汰同样跳过 pending/running，只淘汰已经结束的。
+    """
     now = time.time()
     expired = [
         task_id
         for task_id, task in _tasks.items()
         if now - task.get("created_at", now) > _TASK_TTL_SECONDS
+        and task.get("status") not in ("pending", "running")
     ]
     for task_id in expired:
         _tasks.pop(task_id, None)
+
+    # 容量兜底：按创建顺序淘汰最旧的已完成任务
+    if len(_tasks) >= _TASK_MAXSIZE:
+        finished = [
+            task_id
+            for task_id, task in _tasks.items()
+            if task.get("status") in ("done", "failed")
+        ]
+        for task_id in finished[: max(0, len(_tasks) - _TASK_MAXSIZE + 1)]:
+            _tasks.pop(task_id, None)
 
 
 def _new_task() -> str:
@@ -119,7 +158,20 @@ def _update_task(task_id: str, **fields) -> None:
 
 
 def _run_plan_task(task_id: str, request: TripRequest) -> None:
-    """后台任务：独立实例生成计划，把结果写回任务表。"""
+    """后台任务：独立实例生成计划，把结果写回任务表。
+
+    后台任务跑在 worker 线程里，和事件循环里的同步接口共用同一个闸门，
+    否则异步接口就成了绕过并发的后门（挂着几十个 task 一样能压垮进程）。
+    """
+    if not plan_gate.try_enter():
+        metrics.record_planning_rejected()
+        _update_task(
+            task_id,
+            status="failed",
+            success=False,
+            error=f"当前规划任务已达上限（{plan_gate.limit} 个），请稍后重试",
+        )
+        return
     _update_task(task_id, status="running")
     try:
         trip_plan, status, message = _plan_trip_isolated(request)
@@ -134,6 +186,8 @@ def _run_plan_task(task_id: str, request: TripRequest) -> None:
         )
     except Exception as e:
         _update_task(task_id, status="failed", success=False, error=str(e))
+    finally:
+        plan_gate.leave()
 
 
 def _remember_plan(trip_plan: TripPlan, request: TripRequest) -> str:
@@ -149,8 +203,36 @@ def _remember_plan(trip_plan: TripPlan, request: TripRequest) -> str:
             "plan": trip_plan.model_dump(mode="json"),
             "request": request.model_dump(mode="json"),
             "created_at": time.time(),
+            # 并发修改保护：同一计划同时只允许一轮 refine 在跑
+            "refining": False,
         }
     return plan_id
+
+
+def _claim_plan(plan_id: str) -> str:
+    """占住一个计划准备修改，返回 ok / missing / busy。
+
+    为什么需要：两轮 refine 同时打向同一个 plan_id 时，两边都是从同一版
+    旧计划出发，各自生成一份新计划，后写的把先写的覆盖掉——用户点了两次
+    "改成室内"，最后只剩一个改动生效，另一份白花了 15 秒和一次调用。
+    这是典型的 lost update，用一把进程内的占用标志挡住即可。
+    """
+    with _plans_lock:
+        item = _plans.get(plan_id)
+        if item is None:
+            return "missing"
+        if item.get("refining"):
+            return "busy"
+        item["refining"] = True
+        return "ok"
+
+
+def _release_plan(plan_id: str) -> None:
+    """释放占用。必须放在 finally 里，否则一次失败会把计划永久锁死。"""
+    with _plans_lock:
+        item = _plans.get(plan_id)
+        if item is not None:
+            item["refining"] = False
 
 
 def _load_plan(plan_id: str) -> tuple[TripPlan, TripRequest] | None:
@@ -176,9 +258,16 @@ def _prune_plans_locked() -> None:
     ]
     for plan_id in expired:
         _plans.pop(plan_id, None)
-    # 容量兜底：按插入顺序淘汰最旧的
+    # 容量兜底：按插入顺序淘汰最旧的，但正在被修改的那条不能动
+    # （淘汰了它，正在跑的 refine 结束后就找不到原计划，用户白等一轮）
     while len(_plans) >= _PLAN_MAXSIZE:
-        _plans.pop(next(iter(_plans)), None)
+        victim = next(
+            (plan_id for plan_id, item in _plans.items() if not item.get("refining")),
+            None,
+        )
+        if victim is None:
+            break
+        _plans.pop(victim, None)
 
 
 def diff_plans(before: TripPlan, after: TripPlan) -> PlanDiff:
@@ -261,10 +350,57 @@ async def plan_trip(request: TripRequest):
         # plan_trip 内部是同步阻塞调用（几十秒）。原代码直接在 async 路由里调用，
         # 单 worker 下会把整个事件循环堵死，其他请求（连 /health）都卡住。
         # 用 asyncio.to_thread 丢到线程池执行，事件循环立即可服务其他请求。
-        print("🚀 开始生成旅行计划（线程池执行）...")
-        trip_plan, generation_status, generation_message = await asyncio.to_thread(
-            _plan_trip_isolated, request
-        )
+        # === 改造点：相同请求合并（single flight）===
+        # 用户连点两次"生成"、或前端超时重试，会发出两个一模一样的请求。
+        # 不合并就是两份 3 候选的账单，而且结果几乎一样。
+        coalesce_key = _plan_request_key(request)
+        is_leader, future = single_flight.claim(coalesce_key)
+        coalesced = not is_leader
+
+        if coalesced:
+            metrics.record_coalesced()
+            print("↩️  相同请求正在生成中，合并等待同一份结果（不重复调用 LLM）")
+            try:
+                trip_plan, generation_status, generation_message = await asyncio.wait_for(
+                    asyncio.wrap_future(future), timeout=_COALESCE_WAIT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=504, detail="等待相同请求的结果超时，请稍后重试"
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502, detail=f"相同请求的生成失败: {e}"
+                )
+        else:
+            # === 改造点：并发闸门 ===
+            # 限流管"一分钟能进几个"，闸门管"同一时刻在做几个"。
+            # 只有 leader 占闸门：等待方不产生 LLM 调用，不该占用规划额度。
+            if not plan_gate.try_enter():
+                single_flight.finish(coalesce_key, future, error=PlanningBusy("并发已满"))
+                metrics.record_planning_rejected()
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"当前规划任务已达上限（{plan_gate.limit} 个），请稍后重试",
+                    headers={"Retry-After": "5"},
+                )
+            print("🚀 开始生成旅行计划（线程池执行）...")
+            try:
+                trip_plan, generation_status, generation_message = await asyncio.to_thread(
+                    _plan_trip_isolated, request
+                )
+            except Exception as e:
+                # 先把失败抛给等待者，再往上冒泡
+                single_flight.finish(coalesce_key, future, error=e)
+                raise
+            else:
+                single_flight.finish(
+                    coalesce_key,
+                    future,
+                    result=(trip_plan, generation_status, generation_message),
+                )
+            finally:
+                plan_gate.leave()
 
         # === 改造点：错误语义（消除"假成功"）===
         # 只有真正走 LLM 生成成功（llm_success）才返回 success=True。
@@ -279,6 +415,7 @@ async def plan_trip(request: TripRequest):
                     message=generation_message,
                     data=trip_plan,
                     plan_id=_remember_plan(trip_plan, request),
+                    coalesced=coalesced,
                 ).model_dump(mode="json"),
             )
 
@@ -289,8 +426,13 @@ async def plan_trip(request: TripRequest):
             message=generation_message,
             data=trip_plan,
             plan_id=_remember_plan(trip_plan, request),
+            coalesced=coalesced,
         )
 
+    except HTTPException:
+        # 限流/并发/合并相关的状态码必须原样返回，
+        # 不能被下面那个兜底 except 改成 500。
+        raise
     except Exception as e:
         print(f"❌ 生成旅行计划失败: {str(e)}")
         import traceback
@@ -321,8 +463,32 @@ async def refine_plan(plan_id: str, payload: RefineRequest):
     if restored is None:
         raise HTTPException(status_code=404, detail="计划不存在或已过期，请重新生成")
 
+    # === 改造点：同一计划并发修改加保护 ===
+    # 两轮 refine 同时进来，各自都基于同一份旧计划生成，后写的覆盖先写的，
+    # 用户的一次修改会凭空消失（lost update）。这里用一个占用标志挡住。
+    claim_state = _claim_plan(plan_id)
+    if claim_state == "busy":
+        metrics.record_refine_conflict()
+        raise HTTPException(
+            status_code=409,
+            detail="该计划正在修改中，请等待当前这次完成后再试",
+        )
+    if claim_state == "missing":
+        raise HTTPException(status_code=404, detail="计划不存在或已过期，请重新生成")
+
     previous_plan, request = restored
     print(f"\n📥 收到增量修改请求 plan_id={plan_id[:8]}... 要求: {payload.instruction}")
+
+    # 增量修改也是一次真实 LLM 调用，必须和首次生成共用同一个并发闸门，
+    # 否则"改一句话"就成了绕过限流的后门。
+    if not plan_gate.try_enter():
+        _release_plan(plan_id)
+        metrics.record_planning_rejected()
+        raise HTTPException(
+            status_code=503,
+            detail=f"当前规划任务已达上限（{plan_gate.limit} 个），请稍后重试",
+            headers={"Retry-After": "5"},
+        )
 
     try:
         # 同样用 to_thread：修改也是几十秒的同步阻塞调用
@@ -338,6 +504,9 @@ async def refine_plan(plan_id: str, payload: RefineRequest):
             status_code=502,
             detail=f"增量修改失败，原计划未受影响: {str(e)}",
         )
+    finally:
+        plan_gate.leave()
+        _release_plan(plan_id)
 
     diff = diff_plans(previous_plan, new_plan)
     print(
