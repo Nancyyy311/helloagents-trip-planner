@@ -268,6 +268,85 @@ D2: [八大关, 奥帆中心, 情人坝] → [八大关, 海军博物馆, 奥帆
 > 探活豁免这里踩过一个坑：第一版只豁免 `/health`，实测第 3 次 `/api/trip/health` 就返回 429
 > —— 上线后负载均衡会直接把节点摘掉。改成按 `/health` 后缀匹配，覆盖项目里三个探活入口。
 
+### 4.8 客户端断开之后，后端在干什么？（批次9）
+
+这是本项目最"反直觉"的一段排查，结论是：**在 FastAPI + `BaseHTTPMiddleware` 这套栈上，
+服务端根本探测不到客户端已经走了。** 所有"标准做法"都试过，全部无效。
+
+三条路，逐一实测：
+
+| 做法 | 结果 |
+|---|---|
+| `await request.is_disconnected()`（请求体未读时） | ✅ 能检测到（第 6 次探测，约 1.2s） |
+| `await request.is_disconnected()`（**请求体已读**） | ❌ **恒返回 False** |
+| `request.is_disconnected()` 放在独立 `create_task` + `to_thread` 里 | ❌ 恒返回 False |
+| `StreamingResponse` 每 2 秒写 keepalive，靠写失败判断 | ❌ 6 秒写了 6 个空格，全被内核 socket buffer 吃掉，无异常 |
+
+第一版的实测现场（客户端 2 秒断开，服务端毫无察觉）：
+
+```
+POST /api/trip/plan -> 200 18628ms      ← 客户端早走了，请求照样跑满 18.6 秒
+```
+
+所以代码里**没有**保留这段探测——留着会造成"这里在防御"的错觉，比没有更糟。
+
+**改用任务模型，让客户端自己说"我不要了"：**
+
+```
+POST   /api/trip/plan/async            → 立刻拿 task_id
+GET    /api/trip/plan/async/{task_id}  → 每 1.2s 轮询（同时也是心跳，刷新 last_seen）
+DELETE /api/trip/plan/async/{task_id}  → pagehide 时用 fetch+keepalive 发出去
+```
+
+| 用户行为 | 谁兜住 | 停止延迟 |
+|---|---|---|
+| 关页面 / 刷新 / 点取消 | `DELETE` → `CancelToken` | **0.3–0.4s** |
+| 切到别的 tab | 轮询被节流到 ~60s，仍在 90s 宽限内 | 不中断（正确行为） |
+| 浏览器崩溃 / 断网 | 后端 90s 无轮询 → 孤儿回收 | 90s |
+
+取消延迟还修正过一次：第一版用 `with ThreadPoolExecutor(...)`，退出时 `shutdown(wait=True)`
+会把挂在 LLM 上的候选全部等完：
+
+| | 取消生效耗时 | 期间并发位 |
+|---|---|---|
+| `with ThreadPoolExecutor` | **17.0s** | 一直被占（想重来的用户撞 503） |
+| 手动 `wait(timeout=0.4)` + `shutdown(wait=False)` | **0.3–0.4s** | 立刻释放 |
+
+**诚实的边界**：已经在飞的那次 `client.chat.completions.create` 拦不住——Python 没有安全的
+线程 kill，它一定会跑完并计费。取消能保证的是"下一次调用不再发"。
+
+### 4.9 轮询被自己的限流打死（批次8 的回归）
+
+改成任务模型后第一次实测，**第 2 次轮询就 429**：
+
+```json
+{"success": false, "message": "请求过于频繁（规划档限流），请 9 秒后重试"}
+```
+
+原因：批次8 的 `classify()` 按**路径前缀**分档，`/api/trip/plan/` 开头一律算规划档
+（6 次/分钟、每次扣 2 令牌）。同步接口时代这条路径下只有一个请求，没人发现问题；
+加了轮询之后，`GET /plan/async/{id}` 每 1.2 秒就被扣 2 个令牌，50 次/分钟撞 6 次/分钟。
+
+修法不是"把规划档调大"（那等于放开真正花钱的接口），而是**按成本分档**：
+
+| 路径 | 档位 | 额度 | 会不会触发 LLM |
+|---|---|---|---|
+| `POST /api/trip/plan`、`POST /api/trip/plan/async`、`POST /plan/{id}/refine` | `plan` | 6/分钟，每次扣 2 | 会 |
+| `GET /plan/async/{id}`、`GET .../stream`、`DELETE .../{id}` | `poll`（新增） | 240/分钟 | 不会 |
+| 其他 | `default` | 120/分钟 | — |
+
+注意 `/api/trip/plan/async` 本身是 POST（提交任务，最贵），只有它下面的 `/{task_id}` 才是纯读。
+
+### 4.10 分级探活
+
+| 端点 | 语义 | 缺依赖时 |
+|---|---|---|
+| `GET /healthz` | 存活：进程还在不在 | 永远 200（依赖挂了不代表进程该被重启） |
+| `GET /readyz` | 就绪：能不能接活 | `ready` 200 / `degraded` 200 / `not_ready` 503 |
+
+`degraded` 仍然返回 200 是刻意的：缺高德 Key 只是拿不到真实 POI，计划还能出，
+这时候摘流量是自伤。真正该 503 的只有"没有 LLM Key"。
+
 ---
 
 ## 5. 接口一览
@@ -276,15 +355,18 @@ D2: [八大关, 奥帆中心, 情人坝] → [八大关, 海军博物馆, 奥帆
 |---|---|---|
 | POST | `/api/trip/plan` | 同步生成（兼容保留），返回计划 + `plan_id` |
 | POST | `/api/trip/plan/async` | 提交异步任务，立即返回 `task_id` |
-| GET | `/api/trip/plan/async/{task_id}` | 轮询任务状态 |
+| GET | `/api/trip/plan/async/{task_id}` | 轮询任务状态（同时是"我还在等"的心跳） |
 | GET | `/api/trip/plan/async/{task_id}/stream` | **SSE 推送**任务进度与结果 |
+| DELETE | `/api/trip/plan/async/{task_id}` | **取消任务**：pending 立即 canceled，running 0.4s 内停下 |
 | POST | `/api/trip/plan/{plan_id}/refine` | **增量修改**：改一句话，返回新计划 + 变更摘要 |
 | GET | `/api/trip/health` | 旅行规划子服务健康检查 |
 | GET | `/health` | 应用健康检查 |
-| GET | `/metrics` | 指标快照（含限流/并发/合并计数） |
+| GET | `/healthz` | **存活探针**（永远 200，不检查依赖） |
+| GET | `/readyz` | **就绪探针**（ready / degraded / not_ready 三档） |
+| GET | `/metrics` | 指标快照（含限流/并发/合并/取消计数） |
 | GET | `/docs` · `/redoc` | OpenAPI 文档 |
 
-行程相关端点：**2 → 5 个**。
+行程相关端点：**2 → 6 个**。
 
 失败语义（全部有据可查，不再一律 500）：
 
@@ -292,7 +374,7 @@ D2: [八大关, 奥帆中心, 情人坝] → [八大关, 海军博物馆, 奥帆
 |---|---|
 | 429 | 触发限流，带 `Retry-After` |
 | 503 | 并发规划已满（`PLANNER_MAX_CONCURRENCY`），带 `Retry-After` |
-| 409 | 该计划正在被另一轮修改占用 |
+| 409 | 该计划正在被另一轮修改占用；或试图取消一个已经结束的任务（结果已经在那儿了，不假装成功） |
 | 502 | LLM 失败走了 fallback（返回降级计划 + `success=false`）或增量修改失败（原计划未受影响） |
 
 ---
