@@ -395,6 +395,17 @@ import AMapLoader from '@amap/amap-jsapi-loader'
 // 原来顶层 import 会把它们打进首屏主包，等于让所有访客为一个"导出"按钮付费。
 import type { TripPlan } from '@/types'
 import { API_BASE_URL } from '@/services/api'
+// 纯展示逻辑抽到 utils 后可以脱离浏览器单测（见 src/utils/__tests__/planView.spec.ts）。
+// 这里保持原函数名不变，模板无需改动。
+import {
+  buildAttractionPlaceholder,
+  canRemoveAttraction,
+  getMealLabel,
+  getWeatherCardClass,
+  getWeatherIcon,
+  isLodgingBreakfastMeal,
+  moveInList
+} from '@/utils/planView'
 
 const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
@@ -509,7 +520,7 @@ const deleteAttraction = (dayIndex: number, attrIndex: number) => {
   if (!tripPlan.value) return
 
   const day = tripPlan.value.days[dayIndex]
-  if (day.attractions.length <= 1) {
+  if (!canRemoveAttraction(day.attractions)) {
     message.warning('每天至少需要保留一个景点')
     return
   }
@@ -518,56 +529,12 @@ const deleteAttraction = (dayIndex: number, attrIndex: number) => {
   message.success('景点已删除')
 }
 
-// 移动景点顺序
+// 移动景点顺序。边界判断和交换逻辑在 moveInList 里，首项上移/末项下移是无操作。
 const moveAttraction = (dayIndex: number, attrIndex: number, direction: 'up' | 'down') => {
   if (!tripPlan.value) return
 
   const day = tripPlan.value.days[dayIndex]
-  const attractions = day.attractions
-
-  if (direction === 'up' && attrIndex > 0) {
-    [attractions[attrIndex], attractions[attrIndex - 1]] = [attractions[attrIndex - 1], attractions[attrIndex]]
-  } else if (direction === 'down' && attrIndex < attractions.length - 1) {
-    [attractions[attrIndex], attractions[attrIndex + 1]] = [attractions[attrIndex + 1], attractions[attrIndex]]
-  }
-}
-
-const getMealLabel = (type: string): string => {
-  const labels: Record<string, string> = {
-    breakfast: '早餐',
-    lunch: '午餐',
-    dinner: '晚餐',
-    snack: '小吃'
-  }
-  return labels[type] || type
-}
-
-const normalizeWeatherText = (weather: unknown): string => String(weather || '').trim()
-
-const getWeatherIcon = (weather: unknown, period: 'day' | 'night'): string => {
-  const text = normalizeWeatherText(weather)
-  if (!text || text.includes('未知') || text.includes('暂无')) return '—'
-  if (text.includes('雷')) return '⛈️'
-  if (text.includes('暴雨') || text.includes('大雨')) return '🌧️'
-  if (text.includes('雨')) return '🌦️'
-  if (text.includes('雪')) return '❄️'
-  if (text.includes('冰雹')) return '🌨️'
-  if (text.includes('雾') || text.includes('霾')) return '🌫️'
-  if (text.includes('沙') || text.includes('尘')) return '🌪️'
-  if (text.includes('阴')) return '☁️'
-  if (text.includes('云')) return period === 'night' ? '☁️' : '⛅'
-  if (text.includes('晴')) return period === 'night' ? '🌙' : '☀️'
-  return period === 'night' ? '🌙' : '🌤️'
-}
-
-const getWeatherCardClass = (dayWeather: unknown, nightWeather: unknown): string => {
-  const text = `${normalizeWeatherText(dayWeather)} ${normalizeWeatherText(nightWeather)}`
-  if (!text.trim() || text.includes('未知') || text.includes('暂无')) return 'weather-card-unknown'
-  if (text.includes('雨') || text.includes('雷')) return 'weather-card-rain'
-  if (text.includes('雪')) return 'weather-card-snow'
-  if (text.includes('雾') || text.includes('霾') || text.includes('沙') || text.includes('尘')) return 'weather-card-haze'
-  if (text.includes('阴') || text.includes('云')) return 'weather-card-cloud'
-  return 'weather-card-sun'
+  moveInList(day.attractions, attrIndex, direction)
 }
 
 // 带超时的 fetch。
@@ -620,11 +587,6 @@ const loadAttractionPhotos = async () => {
   await Promise.all(promises)
 }
 
-const isLodgingBreakfastMeal = (type: string, name: string): boolean => {
-  if (type !== 'breakfast') return false
-  return ['酒店早餐', '民宿早餐', '客栈早餐', '住宿早餐'].some(keyword => name.includes(keyword))
-}
-
 const loadMissingMealLocations = async () => {
   if (!tripPlan.value) return
 
@@ -669,37 +631,12 @@ const loadMissingMealLocations = async () => {
   }
 }
 
-// 获取景点图片
+// 获取景点图片：优先真实图，否则用 index 轮换的占位图（避免跨域问题）
 const getAttractionImage = (name: string, index: number): string => {
-  // 如果已加载真实图片,返回真实图片
   if (attractionPhotos.value[name]) {
     return attractionPhotos.value[name]
   }
-
-  // 返回一个纯色占位图(避免跨域问题)
-  const colors = [
-    { start: '#1677ff', end: '#69b1ff' },
-    { start: '#0f766e', end: '#5eead4' },
-    { start: '#475569', end: '#94a3b8' },
-    { start: '#2563eb', end: '#93c5fd' },
-    { start: '#334155', end: '#cbd5e1' }
-  ]
-  const colorIndex = index % colors.length
-  const { start, end } = colors[colorIndex]
-
-  // 使用base64编码避免中文问题
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">
-    <defs>
-      <linearGradient id="grad${index}" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" style="stop-color:${start};stop-opacity:1" />
-        <stop offset="100%" style="stop-color:${end};stop-opacity:1" />
-      </linearGradient>
-    </defs>
-    <rect width="400" height="300" fill="url(#grad${index})"/>
-    <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="24" font-weight="bold" fill="white">${name}</text>
-  </svg>`
-
-  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`
+  return buildAttractionPlaceholder(name, index)
 }
 
 // 图片加载失败时的处理
