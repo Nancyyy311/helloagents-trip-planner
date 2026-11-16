@@ -1,0 +1,65 @@
+NOTICE — 署名与衍生范围说明
+================================================================
+
+本文件用于满足 CC BY-NC-SA 4.0 的署名（BY）义务，不修改许可条款本身。
+许可全文见同目录下的 LICENSE（未做任何改动）。
+
+一、原始项目
+----------------------------------------------------------------
+
+    项目名称：helloagents-trip-planner
+    原作者：  nameless0120 <614550056@qq.com>
+    原始地址：https://github.com/nameless0120/helloagents-trip-planner
+
+原始项目的著作权归原作者所有，按 CC BY-NC-SA 4.0 发布。
+本仓库在其基础上二次开发，保留了全部 23 个上游提交及其作者信息。
+
+二、本仓库新增的修改
+----------------------------------------------------------------
+
+提交历史中作者为 Nancyyy311 的提交（在 fork 之后产生）是本仓库新增的部分，
+同样按 CC BY-NC-SA 4.0 发布，不附加任何额外限制。
+
+大致范围：
+
+    training/   训练脚本、评测数据与文档，主要来自原始项目
+    backend/    在原始实现上改造：并发模型与事件循环阻塞修复、
+                任务生命周期与取消、输出可信性校验（预算重算）、
+                评测体系与指标有效性、缓存新鲜度修复、可观测性
+    frontend/   可测性重构（纯函数外提）、生成中面板组件化、
+                天气展示空值处理
+    backend/scripts/healthcheck.py、audit_budget.py、audit_weather_cache.py
+                为本仓库新增
+
+具体改动与实测数据见 README_改造说明.md、CHANGELOG.md 及各批次台账。
+
+三、第三方组件与素材
+----------------------------------------------------------------
+
+    HelloAgents            https://github.com/datawhalechina/Hello-Agents
+    高德地图开放平台         https://lbs.amap.com/ （Web 服务 API）
+    amap-mcp-server        https://github.com/sugarforever/amap-mcp-server
+    Unsplash               backend/app/planner/photo_assets/ 下的图片
+                           摘自 images.unsplash.com，遵循 Unsplash License
+                           （可免费使用，含商业用途，署名非强制但在此致谢）
+
+四、关于 API Key 与高德数据
+----------------------------------------------------------------
+
+    本仓库不包含任何 API Key。backend/.env 与 frontend/.env 只存在于
+    使用者本地，且已被 .gitignore 排除；.env.example 中只有占位文字。
+    复现本项目需要自行申请 DeepSeek 与高德开放平台的 Key。
+
+    高德接口的原始响应（training/data/cache/）未被提交，仓库中不含
+    批量抓取的高德 POI 数据。运行时取到的数据仅在使用者本地缓存，
+    使用者需自行遵守《高德开放平台服务协议》。
+
+五、使用限制（CC BY-NC-SA 4.0 摘要，以 LICENSE 全文为准）
+----------------------------------------------------------------
+
+    署名      转载、修改、分发时必须保留原作者署名与本 NOTICE；
+    非商业    不得用于商业目的（含接单交付、企业内部系统等）；
+    相同方式  衍生作品必须以 CC BY-NC-SA 4.0 发布，不得改授为 MIT、
+               Apache 等更宽松的许可。
+
+    CC 许可一经发布不可撤销。如需商业使用，须另行联系原作者取得授权。
