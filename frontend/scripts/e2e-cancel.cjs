@@ -17,9 +17,15 @@ const puppeteer = require('puppeteer-core')
 const fs = require('fs')
 const path = require('path')
 
+// 不用写死某台机器的用户名路径：本机 Chrome 装在 %LOCALAPPDATA% 下，
+// 换成别人的机器时这里也能自动找到（写死路径既跑不通别人机器，也泄漏用户名）。
+const localChrome = process.env.LOCALAPPDATA
+  ? path.join(process.env.LOCALAPPDATA, 'Google/Chrome/Application/chrome.exe')
+  : null
+
 const CHROME_CANDIDATES = [
   process.env.CHROME_PATH,
-  'C:/Users/Lenovo/AppData/Local/Google/Chrome/Application/chrome.exe',
+  localChrome,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
